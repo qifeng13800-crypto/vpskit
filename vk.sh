@@ -258,9 +258,13 @@ set_ports(){
       NAT=1
       echo "请看商家后台给你的端口范围，例如 10000-10020"
       local r; r=$(ask "端口范围: ")
-      if [[ "$r" =~ ^([0-9]+)-([0-9]+)$ ]] && valid_port "${BASH_REMATCH[1]}" \
-         && valid_port "${BASH_REMATCH[2]}" && (( BASH_REMATCH[1] <= BASH_REMATCH[2] )); then
-        PORT_MIN=${BASH_REMATCH[1]}; PORT_MAX=${BASH_REMATCH[2]}
+      # 容错: 去掉空格，全角/长横线、波浪号都当作分隔符
+      r=$(echo "$r" | sed -e 's/[[:space:]]//g' -e 's/－/-/g; s/—/-/g; s/–/-/g; s/~/-/g; s/～/-/g')
+      local lo="" hi=""
+      # 先把两段存下来: valid_port 内部也用正则，会清掉 BASH_REMATCH
+      if [[ "$r" =~ ^([0-9]+)-([0-9]+)$ ]]; then lo=${BASH_REMATCH[1]}; hi=${BASH_REMATCH[2]}; fi
+      if valid_port "$lo" && valid_port "$hi" && (( lo <= hi )); then
+        PORT_MIN=$lo; PORT_MAX=$hi
       else
         err "格式不对，应为 起始-结束"; pause; return 1
       fi
