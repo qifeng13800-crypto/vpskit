@@ -904,12 +904,20 @@ check_block(){
   echo "[1/3] 本机是否在监听"
   if port_in_use "$port"; then ok "端口在监听"
   else err "本机没有程序在用这个端口 → 不是被墙，是服务没起来，请运行【一键排查】"; pause; return; fi
+  local tport=$port is_udp=0
   if grep -qE "\|(hysteria2|tuic)\|${port}\|" "$VK_NODES" 2>/dev/null; then
-    warn "这是 UDP 节点，下面的 TCP 检测对它不适用"
+    is_udp=1
+    warn "这是 UDP 节点，外部检测工具只能测 TCP，没法直接测它"
+    if [[ -n "$PANEL_PORT" ]] && port_in_use "$PANEL_PORT"; then
+      tport=$PANEL_PORT
+      echo "改用面板端口 $tport 来判断这个 IP 有没有被墙"
+    else
+      err "本机没有可用来代测的 TCP 端口，请先装面板或建一个 VLESS 节点再测"; pause; return
+    fi
   fi
   echo "[2/3] 从国外多个地点连接测试"
-  local r id res total good
-  r=$(curl -s -m 15 -H 'Accept: application/json' "https://check-host.net/check-tcp?host=${host}:${port}&max_nodes=8")
+  local r id res total good foreign="skip"
+  r=$(curl -s -m 15 -H 'Accept: application/json' "https://check-host.net/check-tcp?host=${host}:${tport}&max_nodes=8")
   id=$(echo "$r" | jq -r '.request_id // empty' 2>/dev/null)
   if [[ -z "$id" ]]; then
     warn "国外检测服务暂时不可用，跳过这一步"
@@ -919,21 +927,85 @@ check_block(){
     total=$(echo "$res" | jq 'length' 2>/dev/null)
     good=$(echo "$res" | jq '[.[] | select(. != null) | .[0] | select(type=="object" and .time != null)] | length' 2>/dev/null)
     echo "国外检测点: ${good:-0} / ${total:-0} 个能连上"
-    if [[ "${good:-0}" -ge 1 ]]; then ok "国外能连上 → 服务器本身正常"
-    else err "国外也连不上 → 多半是商家后台的防火墙/安全组没放行端口 $port，或 NAT 端口映射不对"; fi
+    if [[ "${good:-0}" -ge 1 ]]; then ok "国外能连上 → 服务器本身正常"; foreign="ok"
+    else err "国外也连不上"; foreign="fail"; fi
+  fi
+  if [[ "$foreign" == "fail" ]]; then
+    block_verdict "不是被墙，是服务器这边端口没通到外面" \
+      "$([[ "$NAT" == "1" ]] \
+          && echo "到商家后台检查端口映射: 外部 $tport → 内部 $tport，协议 TCP，状态为启用" \
+          || echo "到商家后台的【防火墙 / 安全组】里放行端口 $tport")" \
+      "改完后重新运行本检测；仍不通就运行菜单 9【一键排查并修复】"
+    pause; return
   fi
   echo "[3/3] 从国内测试（需要你动手一步）"
-  echo "手机【关掉代理】后，用浏览器打开 itdog.cn"
-  echo "选择 TCPing，输入:  $host:$port"
-  line
-  info "怎么看结果:"
-  echo "国外通 + 国内通   → 正常"
-  echo "国外通 + 国内不通 → 被墙"
-  echo "   只这个端口不通: 换端口（重建节点）"
-  echo "   所有端口都不通: IP 被墙，找商家换 IP 或走中转"
-  echo "国外不通          → 不是被墙，是服务器这边的问题"
-  warn "自动的国内检测将在下一版加入（借助你的国内中转机）"
+  echo "手机或电脑【关掉代理】后，用浏览器打开:  https://www.itdog.cn/tcping/"
+  echo "输入下面这串，点测试:"
+  info "    $host:$tport"
+  echo "看地图颜色，然后回来选:"
+  echo "1. 基本全绿（国内大部分地方能连）"
+  echo "2. 基本全红（国内大部分地方超时）"
+  echo "0. 现在没法测，先跳过"
+  local a b other=""
+  a=$(ask "请选择: ")
+  case "$a" in
+    1)
+      if (( is_udp )); then
+        block_verdict "IP 没有被墙" \
+          "这个节点走 UDP，连不上多半是 UDP 被拦: NAT 机检查端口 $port 的映射协议是否选了 UDP" \
+          "手机客户端打开“允许不安全”；小火箭测速方式改成 CONNECT" \
+          "还不行就换用 VLESS + Reality 节点（走 TCP，最稳）"
+      else
+        block_verdict "线路正常，IP 和端口都没有被墙" \
+          "问题在你的手机/电脑这边: 更新代理软件，删掉节点后重新导入链接" \
+          "检查设备时间是否准确（差几分钟就会连不上）" \
+          "能连上但打不开网页: 运行菜单 9【一键排查并修复】"
+      fi ;;
+    2)
+      # 再测一个端口，区分"只封了这个端口"和"整个 IP 被墙"
+      if [[ -n "$PANEL_PORT" && "$PANEL_PORT" != "$tport" ]] && port_in_use "$PANEL_PORT"; then other=$PANEL_PORT
+      else other=$(awk -F'|' -v p="$tport" '$2!="hysteria2" && $2!="tuic" && $2!="relay" && $3!=p {print $3; exit}' "$VK_NODES" 2>/dev/null); fi
+      b=2
+      if [[ -n "$other" ]]; then
+        line
+        echo "再测一个端口，看是只封了这一个端口，还是整个 IP 都不通。"
+        echo "在 itdog 里把输入换成:"
+        info "    $host:$other"
+        echo "1. 这个基本全绿    2. 这个也基本全红"
+        b=$(ask "请选择: ")
+      fi
+      if [[ "$b" == "1" ]]; then
+        block_verdict "只有端口 $tport 被封，IP 没事" \
+          "运行菜单 5【一键搭建节点】重新建一个（会自动换新端口）" \
+          "旧节点可以在面板的“入站”页面里删掉"
+      else
+        block_verdict "这台机器的 IP 被墙了，换端口、换协议都没用" \
+          "办法一（推荐）: 找一台国内能直连的机器当中转。在那台上运行 vk → 7 → 3【链式代理】，粘贴下面的链接" \
+          "办法二: 找商家换 IP，换完回来运行菜单 3 更新连接地址"
+        local nl
+        nl=$(awk -F'|' '$2=="vless-reality"{print $4; exit}' "$VK_NODES" 2>/dev/null)
+        [[ -z "$nl" ]] && nl=$(awk -F'|' '$2!="relay"{print $4; exit}' "$VK_NODES" 2>/dev/null)
+        if [[ -n "$nl" ]]; then
+          echo "本机节点链接（给中转机用，整行复制）:"; echo "$nl"
+        else
+          echo "本机还没有节点: 先运行菜单 5 建一个 VLESS + Reality，再拿它的链接去中转机"
+        fi
+      fi ;;
+    *)
+      echo "之后测完可以再运行本检测。判断方法:"
+      echo "国内全绿 → 没被墙；国内全红 → 被墙（走中转或换 IP）" ;;
+  esac
   pause
+}
+block_verdict(){
+  # block_verdict 结论 办法1 [办法2] [办法3]
+  line
+  info "结论: $1"
+  shift
+  echo "接下来这样做:"
+  local s
+  for s in "$@"; do echo "  · $s"; done
+  line
 }
 
 # ---------- 排查与修复 ----------
