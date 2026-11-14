@@ -22,10 +22,10 @@ ask()  { local a; read -rp "$1" a; echo "$a"; }
 confirm(){ local a; read -rp "$1 [y/n]: " a; [[ "$a" == "y" || "$a" == "Y" ]]; }
 
 # ---------- 配置 ----------
-PORT_MIN=""; PORT_MAX=""; NAT=0; NAT_SAMEPORT=1; PUBLIC_HOST=""
+PORT_MIN=""; PORT_MAX=""; PORT_EXCLUDE=""; NAT=0; NAT_SAMEPORT=1; PUBLIC_HOST=""
 PANEL=""; PANEL_PORT=""; PANEL_PATH=""; PANEL_USER=""; PANEL_PASS=""
 PANEL_SCHEME="http"; API_TOKEN=""; SUB_PORT=""; SUB_PATH=""
-CONF_KEYS="PORT_MIN PORT_MAX NAT NAT_SAMEPORT PUBLIC_HOST PANEL PANEL_PORT PANEL_PATH PANEL_USER PANEL_PASS PANEL_SCHEME API_TOKEN SUB_PORT SUB_PATH"
+CONF_KEYS="PORT_MIN PORT_MAX PORT_EXCLUDE NAT NAT_SAMEPORT PUBLIC_HOST PANEL PANEL_PORT PANEL_PATH PANEL_USER PANEL_PASS PANEL_SCHEME API_TOKEN SUB_PORT SUB_PATH"
 
 load_conf(){ [[ -f "$VK_CONF" ]] && . "$VK_CONF"; return 0; }
 save_conf(){
@@ -76,10 +76,17 @@ in_range(){
   [[ -z "$PORT_MIN" ]] && return 0
   (( $1 >= PORT_MIN && $1 <= PORT_MAX ))
 }
+port_excluded(){
+  # 用户声明"已经在商家后台映射给别的用途"的端口，不再分配
+  local e
+  for e in $PORT_EXCLUDE; do [[ "$e" == "$1" ]] && return 0; done
+  return 1
+}
 pick_port(){
   local lo=${PORT_MIN:-20000} hi=${PORT_MAX:-60000} p i
   for i in $(seq 1 200); do
     p=$(( lo + (RANDOM * 32768 + RANDOM) % (hi - lo + 1) ))
+    port_excluded "$p" && continue
     port_in_use "$p" || { echo "$p"; return 0; }
   done
   return 1
@@ -246,7 +253,7 @@ set_ports(){
   echo "1. 普通机器（端口随便用）"
   echo "2. NAT 机（商家只给一段端口）"
   case "$(ask '请选择: ')" in
-    1) NAT=0; NAT_SAMEPORT=1; PORT_MIN=""; PORT_MAX="" ;;
+    1) NAT=0; NAT_SAMEPORT=1; PORT_MIN=""; PORT_MAX=""; PORT_EXCLUDE="" ;;
     2)
       NAT=1
       echo "请看商家后台给你的端口范围，例如 10000-10020"
@@ -259,7 +266,15 @@ set_ports(){
       fi
       echo "外部端口和机器内部端口是同一个数字吗？"
       echo "（多数商家是同一个。不确定就选 y）"
-      if confirm "是同一个"; then NAT_SAMEPORT=1; else NAT_SAMEPORT=0; fi ;;
+      if confirm "是同一个"; then NAT_SAMEPORT=1; else NAT_SAMEPORT=0; fi
+      echo "这段端口里，有没有已经在商家后台映射给别的用途的？"
+      echo "（最常见的是 SSH 登录用的那个端口。多个用空格隔开，没有就直接回车）"
+      local ex e; ex=$(ask "已占用的端口: "); PORT_EXCLUDE=""
+      for e in $ex; do
+        if valid_port "$e"; then PORT_EXCLUDE="$PORT_EXCLUDE $e"; else warn "忽略无效的端口: $e"; fi
+      done
+      PORT_EXCLUDE=${PORT_EXCLUDE# }
+      [[ -n "$PORT_EXCLUDE" ]] && ok "这些端口不会被分配: $PORT_EXCLUDE" ;;
     *) return 1 ;;
   esac
   local h; h=$(get_ip) || h=""
@@ -1068,7 +1083,7 @@ report(){
     . /etc/os-release 2>/dev/null; echo "系统: ${PRETTY_NAME:-?}  内核: $(uname -r)  架构: $(uname -m)"
     echo "虚拟化: $(systemd-detect-virt 2>/dev/null)  内存: $(awk '/MemTotal/{printf "%dMB", $2/1024}' /proc/meminfo)"
     echo "面板: ${PANEL:-无}  面板端口: ${PANEL_PORT:-无}  协议: $PANEL_SCHEME"
-    echo "NAT: $NAT  端口范围: ${PORT_MIN:-不限}-${PORT_MAX:-不限}  内外同端口: $NAT_SAMEPORT"
+    echo "NAT: $NAT  端口范围: ${PORT_MIN:-不限}-${PORT_MAX:-不限}  内外同端口: $NAT_SAMEPORT  保留端口: ${PORT_EXCLUDE:-无}"
     echo "令牌: $([[ -n "$API_TOKEN" ]] && echo 已设置 || echo 未设置)"
     echo "--- 节点 ---"
     [[ -s "$VK_NODES" ]] && awk -F'|' '{print $1" "$2" "$3}' "$VK_NODES"
