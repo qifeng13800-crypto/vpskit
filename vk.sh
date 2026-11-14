@@ -24,8 +24,8 @@ confirm(){ local a; read -rp "$1 [y/n]: " a; [[ "$a" == "y" || "$a" == "Y" ]]; }
 # ---------- 配置 ----------
 PORT_MIN=""; PORT_MAX=""; PORT_EXCLUDE=""; NAT=0; NAT_SAMEPORT=1; PUBLIC_HOST=""
 PANEL=""; PANEL_PORT=""; PANEL_PATH=""; PANEL_USER=""; PANEL_PASS=""
-PANEL_SCHEME="http"; API_TOKEN=""; SUB_PORT=""; SUB_PATH=""; KOMARI_PORT=""; KOMARI_USER=""; KOMARI_PASS=""
-CONF_KEYS="PORT_MIN PORT_MAX PORT_EXCLUDE NAT NAT_SAMEPORT PUBLIC_HOST PANEL PANEL_PORT PANEL_PATH PANEL_USER PANEL_PASS PANEL_SCHEME API_TOKEN SUB_PORT SUB_PATH KOMARI_PORT KOMARI_USER KOMARI_PASS"
+PANEL_SCHEME="http"; API_TOKEN=""; SUB_PORT=""; SUB_PATH=""; KOMARI_PORT=""; KOMARI_USER=""; KOMARI_PASS=""; KOMARI_DOMAIN=""
+CONF_KEYS="PORT_MIN PORT_MAX PORT_EXCLUDE NAT NAT_SAMEPORT PUBLIC_HOST PANEL PANEL_PORT PANEL_PATH PANEL_USER PANEL_PASS PANEL_SCHEME API_TOKEN SUB_PORT SUB_PATH KOMARI_PORT KOMARI_USER KOMARI_PASS KOMARI_DOMAIN"
 
 load_conf(){ [[ -f "$VK_CONF" ]] && . "$VK_CONF"; return 0; }
 save_conf(){
@@ -894,7 +894,10 @@ KM_AGENT_CONF="$VK_DIR/komari-agent.json"
 km_arch(){ local a; a=$(arch_name); [[ "$a" == "unknown" ]] && return 1; echo "$a"; }
 km_server_installed(){ [[ -x "$KM_DIR/komari" ]]; }
 km_agent_installed(){ [[ -x "$KM_DIR/agent" ]]; }
-km_server_url(){ echo "http://$(get_host):${KOMARI_PORT}"; }
+km_server_url(){
+  if [[ -n "$KOMARI_DOMAIN" ]]; then echo "https://$KOMARI_DOMAIN"
+  else echo "http://$(get_host):${KOMARI_PORT}"; fi
+}
 
 km_setup_needed(){
   # 探针面板首次启动会停在"安装向导"，这里问它还需不需要初始化
@@ -1122,8 +1125,81 @@ km_uninstall(){
       systemctl disable komari --now >/dev/null 2>&1
       rm -f /etc/systemd/system/komari.service "$KM_DIR/komari"
       rm -rf "$KM_DIR/data"
-      systemctl daemon-reload; KOMARI_PORT=""; KOMARI_USER=""; KOMARI_PASS=""; save_conf; ok "已卸载探针面板" ;;
+      systemctl daemon-reload; cloudflared service uninstall >/dev/null 2>&1; KOMARI_PORT=""; KOMARI_USER=""; KOMARI_PASS=""; KOMARI_DOMAIN=""; save_conf; ok "已卸载探针面板" ;;
   esac
+}
+
+km_domain(){
+  # 用 Cloudflare 隧道把域名接到本机的探针面板：不占 443，不用申请证书，不用开端口
+  km_server_installed && [[ -n "$KOMARI_PORT" ]] || { err "本机没有装探针面板，先做 13 → 1"; return 1; }
+  if [[ -n "$KOMARI_DOMAIN" ]]; then
+    echo "当前已绑定域名: $KOMARI_DOMAIN"
+    echo "1. 重新绑定    2. 解除绑定    0. 返回"
+    case "$(ask '请选择: ')" in
+      1) ;;
+      2) cloudflared service uninstall >/dev/null 2>&1
+         systemctl disable cloudflared --now >/dev/null 2>&1
+         KOMARI_DOMAIN=""; save_conf; ok "已解除，探针地址恢复为 $(km_server_url)"
+         echo "Cloudflare 后台里的隧道和域名记录需要你手动删除"; return 0 ;;
+      *) return 0 ;;
+    esac
+  fi
+  local a
+  case "$(arch_name)" in amd64) a=amd64 ;; arm64) a=arm64 ;; *) err "CPU 架构不支持"; return 1 ;; esac
+  info "需要域名的 DNS 在 Cloudflare 上。先在 Cloudflare 网页上做这几步:"
+  echo "  1) 登录 Cloudflare，进入 Zero Trust（第一次进会让你起个团队名，选免费套餐）"
+  echo "  2) 找到 Networks（网络）→ Tunnels（隧道）→ 创建隧道，类型选 Cloudflared，随便起个名字"
+  echo "  3) 页面会显示一条安装命令，里面有一长串 eyJ 开头的字符。复制整条命令"
+  echo "  4) 下一步“公共主机名 / Public Hostname”里这样填:"
+  echo "       子域名: 自己起，如 status      域名: 选你的域名"
+  echo "       类型(Service): HTTP          URL: localhost:${KOMARI_PORT}"
+  info "     ↑ 这个端口号 ${KOMARI_PORT} 要照抄"
+  echo "  5) 保存"
+  line
+  local inp tok dom tmp code i
+  inp=$(ask "粘贴第 3 步复制的命令（或只粘贴 eyJ 开头那串）: ")
+  tok=$(echo "$inp" | tr -d '\r' | grep -oE 'eyJ[A-Za-z0-9_=-]{40,}' | head -n1)
+  [[ -n "$tok" ]] || { err "没找到 eyJ 开头的隧道令牌，请重新复制"; return 1; }
+  dom=$(ask "你在第 4 步填的完整域名（如 status.example.com）: ")
+  dom=$(echo "$dom" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##' | tr 'A-Z' 'a-z')
+  [[ "$dom" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || { err "域名格式不对"; return 1; }
+  if [[ ! -x /usr/local/bin/cloudflared ]]; then
+    tmp=$(mktemp -d)
+    info "正在下载 Cloudflare 隧道程序 ..."
+    download "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${a}" "$tmp/cf" \
+      || { err "下载失败：服务器连不上 GitHub，稍后再试"; rm -rf "$tmp"; return 1; }
+    install -m 755 "$tmp/cf" /usr/local/bin/cloudflared; rm -rf "$tmp"
+  fi
+  cloudflared service uninstall >/dev/null 2>&1
+  if ! cloudflared service install "$tok" >/dev/null 2>&1; then
+    err "隧道服务安装失败，令牌可能不完整。请回 Cloudflare 重新复制安装命令"; return 1
+  fi
+  systemctl enable cloudflared >/dev/null 2>&1; systemctl restart cloudflared 2>/dev/null
+  sleep 5
+  systemctl is-active --quiet cloudflared || {
+    err "隧道没有运行，最近的日志:"; journalctl -u cloudflared -n 6 --no-pager 2>/dev/null | cut -c1-200; return 1; }
+  ok "隧道已连上 Cloudflare"
+  info "正在检查 https://$dom 能不能打开 ..."
+  code=000
+  for i in 1 2 3 4 5 6; do
+    code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' "https://$dom/" 2>/dev/null)
+    [[ "$code" =~ ^(200|301|302|307|308)$ ]] && break
+    sleep 5
+  done
+  KOMARI_DOMAIN=$dom; save_conf
+  if [[ "$code" =~ ^(200|301|302|307|308)$ ]]; then
+    ok "域名已生效"
+  else
+    warn "域名暂时还打不开（返回 $code），通常是这几个原因:"
+    echo "  · 刚保存，等一两分钟再试"
+    echo "  · Cloudflare 里的 URL 没填成 localhost:${KOMARI_PORT}，或类型没选 HTTP"
+    echo "  · 填的域名和 Cloudflare 里的公共主机名不一致"
+  fi
+  line
+  echo "探针地址: https://$dom"
+  line
+  echo "以后添加被监控机器时，探针后台给的安装命令里会用你打开网页时的这个域名。"
+  echo "已经挂上的机器不受影响，不用重装。"
 }
 
 menu_komari(){
@@ -1133,6 +1209,7 @@ menu_komari(){
   echo "2. 安装探针客户端 （每台要监控的机器都装）"
   echo "3. 重启探针"
   echo "4. 卸载"
+  echo "5. 给探针绑定域名 （用 Cloudflare，网址变成 https://你的域名）"
   echo "0. 返回"
   case "$(ask '请选择: ')" in
     1) km_server_install ;;
@@ -1141,6 +1218,7 @@ menu_komari(){
        km_agent_installed && systemctl restart komari-agent
        sleep 2; km_status ;;
     4) km_uninstall ;;
+    5) km_domain ;;
     *) return ;;
   esac
   pause
@@ -1436,7 +1514,7 @@ report(){
     [[ -s "$VK_FWD" ]] && sed -E 's/\|[^|]+\|/|<落地IP>|/' "$VK_FWD"
     echo "--- 监听端口 ---"
     ss -lntuH 2>/dev/null | awk '{print $1, $5, $7}' | head -n 40
-    for svc in s-ui x-ui vpskit-realm komari komari-agent; do
+    for svc in s-ui x-ui vpskit-realm komari komari-agent cloudflared; do
       systemctl list-unit-files 2>/dev/null | grep -q "^$svc.service" || continue
       echo "--- 服务 $svc: $(systemctl is-active "$svc" 2>/dev/null) ---"
       journalctl -u "$svc" -n 25 --no-pager 2>/dev/null | cut -c1-220
