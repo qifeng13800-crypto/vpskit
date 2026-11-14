@@ -1225,15 +1225,70 @@ km_set_port(){
   fi
   ok "探针端口已从 $old 改为 $new"
 }
+KM_NGX_CONF="/etc/nginx/conf.d/vpskit-komari.conf"
+km_nginx_proxy(){
+  # km_nginx_proxy 域名  -> 让已有的 nginx 把这个域名的访问转给探针，别的站点不动
+  local dom=$1 bak=""
+  [[ -d /etc/nginx/conf.d ]] || { err "没找到 nginx 的配置目录 /etc/nginx/conf.d"; return 1; }
+  if grep -rlE "server_name[^;]*[[:space:]]${dom//./\\.}[[:space:];]" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null \
+       | grep -qv "^${KM_NGX_CONF}\$"; then
+    err "nginx 里已经有别的站点在用 $dom 这个域名了，请换一个子域名"; return 1
+  fi
+  [[ -f "$KM_NGX_CONF" ]] && { bak=$(mktemp); command cp -f "$KM_NGX_CONF" "$bak"; }
+  cat > "$KM_NGX_CONF" <<EOF
+# 由 vpskit 生成: 把 $dom 的访问转给本机的 Komari 探针
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $dom;
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:${KOMARI_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$http_x_forwarded_proto;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+EOF
+  if ! nginx -t >/dev/null 2>&1; then
+    err "nginx 检查新配置没通过，已撤销，原有网站不受影响。报错如下:"
+    nginx -t 2>&1 | tail -n 3
+    if [[ -n "$bak" ]]; then command cp -f "$bak" "$KM_NGX_CONF"; else rm -f "$KM_NGX_CONF"; fi
+    [[ -n "$bak" ]] && rm -f "$bak"
+    return 1
+  fi
+  [[ -n "$bak" ]] && rm -f "$bak"
+  systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null
+  sleep 1
+  local c
+  c=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $dom" http://127.0.0.1:80/ 2>/dev/null)
+  if [[ "$c" =~ ^(200|301|302|307|308)$ ]]; then ok "nginx 已经把 $dom 转给探针了"
+  else warn "nginx 规则加上了，但本机试访问返回 $c，稍后看域名检查的结果"; fi
+}
 km_domain_simple(){
   # 最简单的办法: 探针开在 80 端口，Cloudflare 加一条开着小黄云的解析
   if [[ "$NAT" == "1" ]]; then
     warn "NAT 机用不了 80 端口，这个办法不行，请改用【隧道】方式"; return 1
   fi
+  local via_nginx=0
   if [[ "$KOMARI_PORT" != "80" ]] && port_in_use 80; then
-    err "本机的 80 端口已经被别的程序占用了，这个办法不行，请改用【隧道】方式"
-    ss -lntpH 2>/dev/null | awk '$4 ~ /:80$/ {print "  占用者: " $NF}' | head -n 2
-    return 1
+    if command -v nginx >/dev/null 2>&1 && ss -lntpH 2>/dev/null | awk '$4 ~ /:80$/' | grep -q nginx; then
+      via_nginx=1
+      info "本机 80 端口上已经有 nginx 在运行。"
+      echo "工具会给它加一条规则：只有用你的探针域名访问时才转给探针，nginx 上原有的网站不受影响。"
+      line
+    else
+      err "本机的 80 端口已经被别的程序占用了，这个办法不行，请改用【隧道】方式"
+      ss -lntpH 2>/dev/null | awk '$4 ~ /:80$/ {print "  占用者: " $NF}' | head -n 2
+      return 1
+    fi
   fi
   local ip dom code i
   ip=$(get_host)
@@ -1251,7 +1306,9 @@ km_domain_simple(){
   [[ -z "$dom" ]] && return 0
   dom=$(echo "$dom" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##' | tr 'A-Z' 'a-z')
   [[ "$dom" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || { err "域名格式不对"; return 1; }
-  if [[ "$KOMARI_PORT" != "80" ]]; then
+  if (( via_nginx )); then
+    km_nginx_proxy "$dom" || return 1
+  elif [[ "$KOMARI_PORT" != "80" ]]; then
     warn "探针要换到 80 端口。已经挂上的【其他机器】会连不上，需要在它们上面重新粘贴一次安装命令"
     confirm "继续吗" || return 0
     km_set_port 80 || return 1
@@ -1284,6 +1341,7 @@ km_domain(){
       1) KOMARI_DOMAIN="" ;;
       2) cloudflared service uninstall >/dev/null 2>&1
          systemctl disable cloudflared --now >/dev/null 2>&1
+         if [[ -f "$KM_NGX_CONF" ]]; then rm -f "$KM_NGX_CONF"; nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null; fi
          KOMARI_DOMAIN=""; save_conf; ok "已解除，探针地址恢复为 $(km_server_url)"
          echo "Cloudflare 后台里的解析记录（或隧道）需要你手动删除"; return 0 ;;
       *) return 0 ;;
