@@ -947,9 +947,10 @@ km_after_install(){
        echo "第一个打开网页的人会成为管理员，所以不要拖，也不要把地址发给别人" ;;
   esac
   echo
-  info "接下来把要监控的机器挂上去（本机直接装好，其他机器给你一行命令）"
-  if confirm "现在就开始吗"; then km_add_node
-  else echo "以后随时可以: vk → 13 → 2"; fi
+  echo "添加被监控机器的方法:"
+  echo "  1) 登录探针网页后台，点“添加节点”，它会给出一条安装命令"
+  echo "  2) 到要监控的机器上运行 vk → 13 → 2，把那条命令整行粘贴进去"
+  echo "  （本机也要被监控的话，在本机同样做一遍第 2 步）"
 }
 km_server_install(){
   if km_server_installed; then
@@ -1043,16 +1044,6 @@ km_agent_install(){
   echo "  选 n: 只上报监控数据，最安全  [推荐]"
   echo "  选 y: 方便，但探针面板的账号一旦泄露，这台机器也会被控制"
   confirm "允许远程控制" && rc="false"
-  km_agent_deploy "$ep" "$tk" "$rc" 0
-}
-
-km_agent_deploy(){
-  # km_agent_deploy 面板地址 密钥 是否禁用远程控制(true/false) 流量重置日(0=不重置)
-  local ep=$1 tk=$2 rc=${3:-true} mr=${4:-0} a tmp
-  a=$(km_arch) || { err "CPU 架构不支持"; return 1; }
-  [[ "$rc" == "false" ]] || rc="true"
-  [[ "$mr" =~ ^[0-9]+$ ]] && (( mr >= 1 && mr <= 31 )) || mr=0
-  [[ "$ep" =~ ^https?://[^/]+ && -n "$tk" ]] || { err "探针地址或密钥不对"; return 1; }
   tmp=$(mktemp -d)
   info "正在下载 Komari 客户端 ..."
   download "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${a}" "$tmp/agent" \
@@ -1061,8 +1052,8 @@ km_agent_deploy(){
   systemctl stop komari-agent 2>/dev/null
   install -m 755 "$tmp/agent" "$KM_DIR/agent"; rm -rf "$tmp"
   # 密钥放在只有 root 能读的配置文件里，不写进服务文件（那里谁都能看到）
-  ( umask 077; jq -n --arg e "$ep" --arg t "$tk" --argjson d "$rc" --argjson m "$mr" \
-      '{endpoint:$e,token:$t,disable_web_ssh:$d} + (if $m > 0 then {month_rotate:$m} else {} end)' > "$KM_AGENT_CONF" )
+  ( umask 077; jq -n --arg e "$ep" --arg t "$tk" --argjson d "$rc" \
+      '{endpoint:$e,token:$t,disable_web_ssh:$d}' > "$KM_AGENT_CONF" )
   chmod 600 "$KM_AGENT_CONF"
   cat > /etc/systemd/system/komari-agent.service <<EOF
 [Unit]
@@ -1084,189 +1075,16 @@ EOF
   systemctl restart komari-agent
   sleep 4
   if systemctl is-active --quiet komari-agent; then
-    ok "探针客户端已启动，几秒后探针网页上会显示这台机器在线"
+    ok "探针客户端已启动"
+    echo "回到探针网页看一下，这台机器应该在几秒内显示为在线"
     [[ "$rc" == "true" ]] && echo "远程控制: 已关闭" || warn "远程控制: 已开启"
-    (( mr > 0 )) && echo "流量统计: 每月 $mr 号重置"
     if journalctl -u komari-agent --since "10 sec ago" --no-pager 2>/dev/null | grep -qiE 'unauthorized|invalid token|401|403'; then
-      warn "日志里有认证失败的字样，密钥可能不对"
+      warn "日志里有认证失败的字样，密钥可能不对。到探针后台重新复制安装命令再试"
     fi
   else
     err "探针客户端启动失败，最近的日志:"
     journalctl -u komari-agent -n 8 --no-pager 2>/dev/null | cut -c1-200
     return 1
-  fi
-}
-
-# ---- 探针后台接口（只在装了探针面板的那台机器上用，走本机地址） ----
-KM_SESSION="$VK_DIR/.km-session"
-km_local(){ echo "http://127.0.0.1:${KOMARI_PORT}"; }
-km_api(){
-  # km_api GET|POST 路径 [JSON]
-  local d=${3:-}; [[ -z "$d" ]] && d='{}'
-  local ck="Cookie: session_token=$(cat "$KM_SESSION" 2>/dev/null)"
-  if [[ "$1" == "GET" ]]; then curl -s -m 20 -H "$ck" "$(km_local)$2"
-  else curl -s -m 30 -H "$ck" -H 'Content-Type: application/json' -d "$d" "$(km_local)$2"; fi
-}
-km_logged_in(){
-  [[ -s "$KM_SESSION" ]] || return 1
-  local c
-  c=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Cookie: session_token=$(cat "$KM_SESSION")" \
-        "$(km_local)/api/admin/client/list")
-  [[ "$c" == "200" ]]
-}
-km_try_login(){
-  local r t
-  r=$(curl -s -m 15 -H 'Content-Type: application/json' \
-        -d "$(jq -cn --arg u "$KOMARI_USER" --arg p "$KOMARI_PASS" '{username:$u,password:$p}')" \
-        "$(km_local)/api/login")
-  t=$(echo "$r" | jq -r '[.. | objects | select(has("session_token")) | .session_token][0] // empty' 2>/dev/null)
-  [[ -n "$t" ]] || { KM_LOGIN_MSG=$(echo "$r" | jq -r '.message // empty' 2>/dev/null); return 1; }
-  mkdir -p "$VK_DIR"; ( umask 077; printf '%s' "$t" > "$KM_SESSION" ); chmod 600 "$KM_SESSION"
-  km_logged_in
-}
-km_api_login(){
-  km_server_installed && [[ -n "$KOMARI_PORT" ]] || {
-    err "本机没有装探针面板。这一步要在【装了探针面板的那台机器】上做"; return 1; }
-  km_logged_in && return 0
-  KM_LOGIN_MSG=""
-  [[ -n "$KOMARI_USER" ]] && km_try_login && return 0
-  line
-  warn "需要探针后台的账号密码（你自己在网页上创建或修改过的话，工具不知道）"
-  [[ -n "$KM_LOGIN_MSG" ]] && echo "面板的提示: $KM_LOGIN_MSG"
-  KOMARI_USER=$(ask "探针账号: ")
-  read -rsp "探针密码（输入时不显示）: " KOMARI_PASS; echo
-  if km_try_login; then save_conf; ok "登录成功，已保存"; return 0; fi
-  err "登录失败: ${KM_LOGIN_MSG:-账号或密码不对}"
-  echo "如果探针账号开了两步验证(2FA)，工具没法自动登录，请在网页后台手动添加机器"
-  return 1
-}
-km_nodes_json(){
-  km_api GET /api/admin/client/list \
-    | jq -c '[.. | objects | select(has("uuid") and has("name")) | {uuid, name}] | unique_by(.uuid)' 2>/dev/null
-}
-
-km_ping_defaults(){
-  # 第一次用时自动加上延迟检测任务；以后新加的机器会自动启用
-  local cur n uu
-  cur=$(km_api GET /api/admin/ping/)
-  n=$(echo "$cur" | jq '[.. | objects | select(has("target") and has("interval"))] | length' 2>/dev/null)
-  [[ "${n:-0}" -gt 0 ]] && return 0
-  uu=$(km_nodes_json | jq -c '[.[].uuid]' 2>/dev/null); [[ -z "$uu" ]] && uu='[]'
-  local item name target okc=0
-  for item in "国内-阿里|223.5.5.5" "国内-腾讯|119.29.29.29" "国内-114|114.114.114.114" "国外-Cloudflare|1.1.1.1"; do
-    name=${item%%|*}; target=${item##*|}
-    km_api POST /api/admin/ping/add "$(jq -cn --arg n "$name" --arg t "$target" --argjson c "$uu" \
-      '{name:$n,target:$t,type:"icmp",interval:60,default_on:true,clients:$c}')" \
-      | jq -e '.status == "success"' >/dev/null 2>&1 && okc=$((okc+1))
-  done
-  if (( okc > 0 )); then ok "已添加 $okc 个延迟检测（到国内三个点和一个国外点，每分钟测一次）"
-  else warn "延迟检测没能自动加上，可以到探针后台的“延迟监测”里手动添加"; fi
-}
-
-B_JSON='{}'; B_ROTATE=0
-km_ask_billing(){
-  # 询问账单和流量信息，结果放进 B_JSON（给探针后台）和 B_ROTATE（给客户端）
-  B_JSON='{}'; B_ROTATE=0
-  line
-  info "下面几项都可以直接回车跳过，以后随时能在菜单里改"
-  local price cur cyc exp gb typ day v
-  price=$(ask "每期付多少钱（只填数字，如 35；免费的填 -1）: ")
-  if [[ "$price" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
-    echo "货币:  1. ￥ 人民币   2. \$ 美元   3. € 欧元"
-    case "$(ask '请选择 [默认 1]: ')" in 2) cur='$' ;; 3) cur='€' ;; *) cur='￥' ;; esac
-    echo "多久付一次:  1. 月付   2. 季付   3. 半年付   4. 年付"
-    case "$(ask '请选择 [默认 1]: ')" in 2) cyc=90 ;; 3) cyc=180 ;; 4) cyc=365 ;; *) cyc=30 ;; esac
-    B_JSON=$(echo "$B_JSON" | jq -c --argjson p "$price" --arg c "$cur" --argjson b "$cyc" \
-      '. + {price:$p, currency:$c, billing_cycle:$b}')
-  elif [[ -n "$price" ]]; then warn "价格不是数字，已跳过"; fi
-  exp=$(ask "到期日期（格式 2027-01-31）: ")
-  if [[ -n "$exp" ]]; then
-    exp=$(echo "$exp" | tr './' '--')
-    if v=$(date -d "$exp" +%Y-%m-%d 2>/dev/null) && [[ -n "$v" ]]; then
-      B_JSON=$(echo "$B_JSON" | jq -c --arg e "${v}T00:00:00Z" '. + {expired_at:$e}')
-    else warn "日期格式不对，已跳过"; fi
-  fi
-  gb=$(ask "每月流量多少 GB（如 500；1T 就填 1024；不限流量直接回车）: ")
-  if [[ "$gb" =~ ^[0-9]+$ ]] && (( gb > 0 )); then
-    echo "流量怎么算（看商家的说明，不确定选 1）:"
-    echo "  1. 上传 + 下载 合计     2. 只算上传（出站）     3. 上传、下载取大的"
-    case "$(ask '请选择 [默认 1]: ')" in 2) typ=up ;; 3) typ=max ;; *) typ=sum ;; esac
-    B_JSON=$(echo "$B_JSON" | jq -c --argjson g "$gb" --arg t "$typ" \
-      '. + {traffic_limit: ($g * 1073741824), traffic_limit_type:$t}')
-    day=$(ask "流量每月几号重置（1-31，一般是购买那天的日期）: ")
-    [[ "$day" =~ ^[0-9]+$ ]] && (( day >= 1 && day <= 31 )) && B_ROTATE=$day
-  elif [[ -n "$gb" ]]; then warn "流量不是整数，已跳过"; fi
-}
-km_apply_billing(){
-  # km_apply_billing uuid
-  [[ "$B_JSON" == "{}" ]] && return 0
-  local r
-  r=$(km_api POST "/api/admin/client/$1/edit" "$(echo "$B_JSON" | jq -c --arg u "$1" '. + {uuid:$u}')")
-  if echo "$r" | jq -e '.status == "success"' >/dev/null 2>&1; then ok "账单和流量信息已保存"
-  else warn "账单信息没保存上: $(echo "$r" | jq -r '.message // empty' 2>/dev/null | cut -c1-120)"; fi
-}
-km_remote_cmd(){
-  # km_remote_cmd 密钥 重置日  -> 打印给另一台机器用的一行命令
-  local url="https://raw.githubusercontent.com/qifeng13800-crypto/vpskit/${VK_BRANCH:-main}/vk.sh"
-  line
-  info "到那台机器上（root 登录），整行粘贴下面这条命令:"
-  echo
-  echo "curl -fsSL $url -o /root/vk.sh && bash /root/vk.sh komari-agent '$(km_server_url)' '$1' ${2:-0}"
-  echo
-  line
-  echo "粘贴运行后，那台机器几秒内就会出现在探针网页上。"
-  echo "这条命令里有密钥，只用于那一台机器，不要发给别人。"
-}
-km_add_node(){
-  km_api_login || return 1
-  km_ping_defaults
-  while true; do
-    line
-    local name where r uuid token
-    name=$(ask "给要监控的机器起个名字（如 德国、香港中转；回车结束）: ")
-    [[ -z "$name" ]] && return 0
-    echo "这台机器是:  1. 就是本机   2. 另一台机器"
-    where=$(ask "请选择: ")
-    [[ "$where" == "1" || "$where" == "2" ]] || { err "请输入 1 或 2"; continue; }
-    if [[ "$where" == "1" ]] && km_agent_installed; then
-      warn "本机已经装过探针客户端了，继续会登记成一台新机器并覆盖原来的"
-      confirm "继续吗" || continue
-    fi
-    B_ROTATE=0
-    r=$(km_api POST /api/admin/client/add "$(jq -cn --arg n "$name" '{name:$n}')")
-    uuid=$(echo "$r" | jq -r '[.. | objects | select(has("token") and has("uuid")) | .uuid][0] // empty' 2>/dev/null)
-    token=$(echo "$r" | jq -r '[.. | objects | select(has("token") and has("uuid")) | .token][0] // empty' 2>/dev/null)
-    if [[ -z "$uuid" || -z "$token" ]]; then
-      err "在探针后台登记失败: $(echo "$r" | cut -c1-160)"; return 1
-    fi
-    ok "已在探针后台登记: $name"
-    if [[ "$where" == "1" ]]; then
-      km_agent_deploy "$(km_local)" "$token" true "$B_ROTATE"
-    else
-      km_remote_cmd "$token" "$B_ROTATE"
-      pause
-    fi
-    confirm "继续添加下一台吗" || return 0
-  done
-}
-km_edit_node(){
-  km_api_login || return 1
-  local list n i uuid name tk
-  list=$(km_nodes_json)
-  n=$(echo "$list" | jq 'length' 2>/dev/null)
-  [[ "${n:-0}" -gt 0 ]] || { warn "探针后台里还没有机器"; return 0; }
-  for i in $(seq 0 $((n-1))); do echo "$((i+1)). $(echo "$list" | jq -r ".[$i].name")"; done
-  i=$(ask "改第几台: ")
-  [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= n )) || { err "输入不对"; return 1; }
-  uuid=$(echo "$list" | jq -r ".[$((i-1))].uuid"); name=$(echo "$list" | jq -r ".[$((i-1))].name")
-  info "修改: $name"
-  km_ask_billing
-  km_apply_billing "$uuid"
-  if (( B_ROTATE > 0 )); then
-    echo "流量重置日要在那台机器上生效，还需要重新运行一次它的安装命令:"
-    tk=$(km_api GET "/api/admin/client/$uuid/token" | jq -r '[.. | objects | select(has("token")) | .token][0] // empty' 2>/dev/null)
-    if [[ -n "$tk" ]]; then km_remote_cmd "$tk" "$B_ROTATE"
-    else warn "没取到这台机器的密钥，请到探针后台复制安装命令"; fi
   fi
 }
 
@@ -1311,22 +1129,18 @@ km_uninstall(){
 menu_komari(){
   clear; info "== Komari 探针（看所有机器的在线、流量、负载） =="
   km_status
-  echo "1. 安装探针面板        （只在一台机器上装，用浏览器看）"
-  echo "2. 添加要监控的机器    （在装了面板的这台上操作：本机直接装好，其他机器给一行命令）"
-  echo "3. 修改机器的价格、到期日、月流量"
-  echo "4. 手动安装客户端      （已经有探针地址和密钥时用）"
-  echo "5. 重启探针"
-  echo "6. 卸载"
+  echo "1. 安装探针面板   （只在一台机器上装，用浏览器看）"
+  echo "2. 安装探针客户端 （每台要监控的机器都装）"
+  echo "3. 重启探针"
+  echo "4. 卸载"
   echo "0. 返回"
   case "$(ask '请选择: ')" in
     1) km_server_install ;;
-    2) km_add_node ;;
-    3) km_edit_node ;;
-    4) km_agent_install ;;
-    5) km_server_installed && systemctl restart komari
+    2) km_agent_install ;;
+    3) km_server_installed && systemctl restart komari
        km_agent_installed && systemctl restart komari-agent
        sleep 2; km_status ;;
-    6) km_uninstall ;;
+    4) km_uninstall ;;
     *) return ;;
   esac
   pause
@@ -1699,17 +1513,6 @@ main(){
   load_conf
   install_deps || exit 1
   self_install
-  # 一行命令挂探针: bash vk.sh komari-agent 探针地址 密钥 [流量重置日]
-  if [[ "${1:-}" == "komari-agent" ]]; then
-    [[ -n "${2:-}" && -n "${3:-}" ]] || { err "用法: bash vk.sh komari-agent 探针地址 密钥 [流量重置日]"; exit 1; }
-    local code
-    code=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' "${2%/}/" 2>/dev/null)
-    if [[ "$code" == "000" || -z "$code" ]]; then
-      warn "这台机器现在连不上探针面板 $2（面板那台的端口没放行？）。先装上，通了会自动连"
-    fi
-    km_agent_deploy "${2%/}" "$3" true "${4:-0}"
-    exit $?
-  fi
   main_menu
 }
 
