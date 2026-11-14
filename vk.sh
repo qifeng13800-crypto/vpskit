@@ -24,8 +24,8 @@ confirm(){ local a; read -rp "$1 [y/n]: " a; [[ "$a" == "y" || "$a" == "Y" ]]; }
 # ---------- 配置 ----------
 PORT_MIN=""; PORT_MAX=""; PORT_EXCLUDE=""; NAT=0; NAT_SAMEPORT=1; PUBLIC_HOST=""
 PANEL=""; PANEL_PORT=""; PANEL_PATH=""; PANEL_USER=""; PANEL_PASS=""
-PANEL_SCHEME="http"; API_TOKEN=""; SUB_PORT=""; SUB_PATH=""; KOMARI_PORT=""
-CONF_KEYS="PORT_MIN PORT_MAX PORT_EXCLUDE NAT NAT_SAMEPORT PUBLIC_HOST PANEL PANEL_PORT PANEL_PATH PANEL_USER PANEL_PASS PANEL_SCHEME API_TOKEN SUB_PORT SUB_PATH KOMARI_PORT"
+PANEL_SCHEME="http"; API_TOKEN=""; SUB_PORT=""; SUB_PATH=""; KOMARI_PORT=""; KOMARI_USER=""; KOMARI_PASS=""
+CONF_KEYS="PORT_MIN PORT_MAX PORT_EXCLUDE NAT NAT_SAMEPORT PUBLIC_HOST PANEL PANEL_PORT PANEL_PATH PANEL_USER PANEL_PASS PANEL_SCHEME API_TOKEN SUB_PORT SUB_PATH KOMARI_PORT KOMARI_USER KOMARI_PASS"
 
 load_conf(){ [[ -f "$VK_CONF" ]] && . "$VK_CONF"; return 0; }
 save_conf(){
@@ -896,9 +896,72 @@ km_server_installed(){ [[ -x "$KM_DIR/komari" ]]; }
 km_agent_installed(){ [[ -x "$KM_DIR/agent" ]]; }
 km_server_url(){ echo "http://$(get_host):${KOMARI_PORT}"; }
 
+km_setup_needed(){
+  # 探针面板首次启动会停在"安装向导"，这里问它还需不需要初始化
+  local r
+  r=$(curl -s -m 8 "http://127.0.0.1:${KOMARI_PORT}/api/install/status" 2>/dev/null)
+  echo "$r" | jq -e '.. | objects | select(has("required")) | .required == true' >/dev/null 2>&1
+}
+km_setup(){
+  # 代替网页上的安装向导：创建管理员、站点名、监控数据库，全部用默认值
+  local i r code body
+  for i in $(seq 1 15); do port_in_use "$KOMARI_PORT" && break; sleep 1; done
+  if ! km_setup_needed; then return 2; fi
+  KOMARI_USER="admin$(rand_str 2)"
+  KOMARI_PASS="Km$(rand_str 7)9x"          # 面板要求同时有大写、小写和数字
+  body=$(jq -cn --arg u "$KOMARI_USER" --arg p "$KOMARI_PASS" \
+    '{username:$u,password:$p,sitename:"Komari",description:"",metric_dsn:"./data/metrics.db"}')
+  r=$(curl -s -m 40 -w '\n%{http_code}' -H 'Content-Type: application/json' \
+        -d "$body" "http://127.0.0.1:${KOMARI_PORT}/api/install/complete" 2>/dev/null)
+  code=${r##*$'\n'}
+  if [[ "$code" != "200" ]]; then
+    KOMARI_USER=""; KOMARI_PASS=""
+    err "自动初始化没成功（返回 $code）: $(echo "${r%$'\n'*}" | cut -c1-160)"
+    return 1
+  fi
+  save_conf
+  # 初始化完成后面板会切换到正常模式，等它重新就绪
+  sleep 3
+  for i in $(seq 1 20); do port_in_use "$KOMARI_PORT" && break; sleep 1; done
+  return 0
+}
+km_show_login(){
+  line
+  echo "探针面板地址: $(km_server_url)"
+  if [[ -n "$KOMARI_USER" ]]; then
+    echo "账号: $KOMARI_USER"
+    echo "密码: $KOMARI_PASS"
+  fi
+  line
+}
+km_after_install(){
+  km_setup
+  case $? in
+    0) ok "探针面板已初始化好，不用再走网页上的安装向导"
+       km_show_login
+       warn "请截图保存上面的地址、账号、密码" ;;
+    2) km_show_login
+       [[ -z "$KOMARI_USER" ]] && echo "这个面板已经初始化过了，用你当时设置的账号密码登录" ;;
+    *) km_show_login
+       warn "请【现在】就用浏览器打开上面的地址，按网页上的安装向导创建管理员账号"
+       echo "第一个打开网页的人会成为管理员，所以不要拖，也不要把地址发给别人" ;;
+  esac
+  echo
+  echo "添加被监控机器的方法:"
+  echo "  1) 登录探针网页后台，点“添加节点”，它会给出一条安装命令"
+  echo "  2) 到要监控的机器上运行 vk → 13 → 2，把那条命令整行粘贴进去"
+  echo "  （本机也要被监控的话，在本机同样做一遍第 2 步）"
+}
 km_server_install(){
   if km_server_installed; then
-    warn "本机已经装了探针面板"; km_status; return 0
+    warn "本机已经装了探针面板"
+    if [[ -n "$KOMARI_PORT" ]] && km_setup_needed; then
+      info "它还停在安装向导那一步，现在替你自动完成 ..."
+      km_after_install
+    else
+      km_status
+    fi
+    return 0
   fi
   local a tmp
   a=$(km_arch) || { err "CPU 架构不支持"; return 1; }
@@ -939,16 +1002,7 @@ EOF
   fi
   ok "探针面板已启动"
   nat_hint "$KOMARI_PORT" "TCP" "探针面板"
-  line
-  echo "探针面板地址: $(km_server_url)"
-  line
-  warn "请【现在】就用浏览器打开上面的地址，创建管理员账号"
-  echo "第一个打开网页的人会成为管理员，所以不要拖，也不要把地址发给别人"
-  echo
-  echo "建好账号后，添加被监控机器的方法:"
-  echo "  1) 在探针网页后台点“添加节点”，它会给出一条安装命令"
-  echo "  2) 到要监控的机器上运行 vk → 13 → 2，把那条命令整行粘贴进去"
-  echo "  （本机也要被监控的话，在本机同样做一遍第 2 步）"
+  km_after_install
 }
 
 km_parse(){
@@ -1038,6 +1092,7 @@ km_status(){
   line
   if km_server_installed; then
     echo "探针面板  : $(systemctl is-active komari 2>/dev/null)   地址: $(km_server_url)"
+    [[ -n "$KOMARI_USER" ]] && echo "            账号: $KOMARI_USER   密码: $KOMARI_PASS"
   else echo "探针面板  : 本机未安装"; fi
   if km_agent_installed; then
     local ep rc
@@ -1067,7 +1122,7 @@ km_uninstall(){
       systemctl disable komari --now >/dev/null 2>&1
       rm -f /etc/systemd/system/komari.service "$KM_DIR/komari"
       rm -rf "$KM_DIR/data"
-      systemctl daemon-reload; KOMARI_PORT=""; save_conf; ok "已卸载探针面板" ;;
+      systemctl daemon-reload; KOMARI_PORT=""; KOMARI_USER=""; KOMARI_PASS=""; save_conf; ok "已卸载探针面板" ;;
   esac
 }
 
