@@ -1129,7 +1129,7 @@ km_uninstall(){
   esac
 }
 
-km_domain(){
+km_domain_tunnel(){
   # 用 Cloudflare 隧道把域名接到本机的探针面板：不占 443，不用申请证书，不用开端口
   km_server_installed && [[ -n "$KOMARI_PORT" ]] || { err "本机没有装探针面板，先做 13 → 1"; return 1; }
   if [[ -n "$KOMARI_DOMAIN" ]]; then
@@ -1200,6 +1200,105 @@ km_domain(){
   line
   echo "以后添加被监控机器时，探针后台给的安装命令里会用你打开网页时的这个域名。"
   echo "已经挂上的机器不受影响，不用重装。"
+}
+
+km_set_port(){
+  # 把探针面板换到指定端口，并让本机的客户端跟着改
+  local new=$1 old=$KOMARI_PORT f=/etc/systemd/system/komari.service
+  [[ "$new" == "$old" ]] && return 0
+  [[ -f "$f" ]] || { err "没找到探针的服务文件"; return 1; }
+  sed -i -E "s#(server -l [0-9.]+:)[0-9]+#\1${new}#" "$f"
+  grep -q ":${new}\$" "$f" || grep -q ":${new} " "$f" || { err "修改探针端口失败"; return 1; }
+  KOMARI_PORT=$new; save_conf
+  systemctl daemon-reload; systemctl restart komari; sleep 3
+  if ! port_in_use "$new"; then
+    err "探针在端口 $new 上没启动，正在改回 $old ..."
+    sed -i -E "s#(server -l [0-9.]+:)[0-9]+#\1${old}#" "$f"
+    KOMARI_PORT=$old; save_conf; systemctl daemon-reload; systemctl restart komari
+    return 1
+  fi
+  open_fw "$new"
+  if [[ -f "$KM_AGENT_CONF" ]] && grep -q "127.0.0.1:${old}\"" "$KM_AGENT_CONF"; then
+    local t; t=$(mktemp)
+    jq --arg e "http://127.0.0.1:${new}" '.endpoint=$e' "$KM_AGENT_CONF" > "$t" && command cat "$t" > "$KM_AGENT_CONF"
+    rm -f "$t"; systemctl restart komari-agent 2>/dev/null
+  fi
+  ok "探针端口已从 $old 改为 $new"
+}
+km_domain_simple(){
+  # 最简单的办法: 探针开在 80 端口，Cloudflare 加一条开着小黄云的解析
+  if [[ "$NAT" == "1" ]]; then
+    warn "NAT 机用不了 80 端口，这个办法不行，请改用【隧道】方式"; return 1
+  fi
+  if [[ "$KOMARI_PORT" != "80" ]] && port_in_use 80; then
+    err "本机的 80 端口已经被别的程序占用了，这个办法不行，请改用【隧道】方式"
+    ss -lntpH 2>/dev/null | awk '$4 ~ /:80$/ {print "  占用者: " $NF}' | head -n 2
+    return 1
+  fi
+  local ip dom code i
+  ip=$(get_host)
+  info "先在 Cloudflare 网页上做两件事:"
+  echo "  1) 点你的域名 → DNS → 添加记录:"
+  echo "       类型: A     名称: 自己起，如 status     IPv4 地址: $ip"
+  echo "       代理状态: 打开（云朵是橙色的）"
+  echo "  2) 点你的域名 → SSL/TLS → 概述 → 加密模式，选【灵活 / Flexible】"
+  line
+  warn "两点说明:"
+  echo "  · 【灵活】模式对这个域名下的所有网站都生效。域名上还有别的网站在用的话先别选，改用隧道"
+  echo "  · 你到 Cloudflare 这段是加密的；Cloudflare 到这台服务器这段不加密"
+  line
+  dom=$(ask "你在第 1 步设置的完整域名（如 status.example.com；回车取消）: ")
+  [[ -z "$dom" ]] && return 0
+  dom=$(echo "$dom" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##' | tr 'A-Z' 'a-z')
+  [[ "$dom" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || { err "域名格式不对"; return 1; }
+  if [[ "$KOMARI_PORT" != "80" ]]; then
+    warn "探针要换到 80 端口。已经挂上的【其他机器】会连不上，需要在它们上面重新粘贴一次安装命令"
+    confirm "继续吗" || return 0
+    km_set_port 80 || return 1
+  fi
+  info "正在检查 https://$dom 能不能打开 ..."
+  code=000
+  for i in 1 2 3 4 5 6; do
+    code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' "https://$dom/" 2>/dev/null)
+    [[ "$code" =~ ^(200|301|302|307|308)$ ]] && break
+    sleep 5
+  done
+  KOMARI_DOMAIN=$dom; save_conf
+  if [[ "$code" =~ ^(200|301|302|307|308)$ ]]; then ok "域名已生效"
+  else
+    warn "域名暂时还打不开（返回 $code），对照检查:"
+    echo "  · 刚加的解析，等一两分钟再试"
+    echo "  · 返回 521 / 522 / 525: 加密模式没选成【灵活】，或云朵不是橙色"
+    echo "  · 解析里的 IP 是不是 $ip"
+  fi
+  line
+  echo "探针地址: https://$dom"
+  line
+}
+km_domain(){
+  km_server_installed && [[ -n "$KOMARI_PORT" ]] || { err "本机没有装探针面板，先做 13 → 1"; return 1; }
+  if [[ -n "$KOMARI_DOMAIN" ]]; then
+    echo "当前已绑定域名: $KOMARI_DOMAIN"
+    echo "1. 重新绑定    2. 解除绑定    0. 返回"
+    case "$(ask '请选择: ')" in
+      1) KOMARI_DOMAIN="" ;;
+      2) cloudflared service uninstall >/dev/null 2>&1
+         systemctl disable cloudflared --now >/dev/null 2>&1
+         KOMARI_DOMAIN=""; save_conf; ok "已解除，探针地址恢复为 $(km_server_url)"
+         echo "Cloudflare 后台里的解析记录（或隧道）需要你手动删除"; return 0 ;;
+      *) return 0 ;;
+    esac
+  fi
+  echo "域名的 DNS 需要在 Cloudflare 上。选一种方式:"
+  echo "1. 加一条解析就行  [最简单]"
+  echo "   探针会换到 80 端口；需要把域名的加密模式设为【灵活】"
+  echo "2. Cloudflare 隧道"
+  echo "   设置步骤多一些，但全程加密、不用开端口，NAT 机或 80 端口被占用时用这个"
+  echo "0. 返回"
+  case "$(ask '请选择: ')" in
+    1) km_domain_simple ;;
+    2) km_domain_tunnel ;;
+  esac
 }
 
 menu_komari(){
