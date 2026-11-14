@@ -1,0 +1,998 @@
+#!/usr/bin/env bash
+# vpskit (vk) —— 小白一键工具  第一版 v0.1
+# 适配: Ubuntu 22/24, Debian 11/12   需要 root
+# 用法: bash vk.sh    安装后直接输入: vk
+
+VK_VERSION="0.1"
+VK_DIR="/etc/vpskit"
+VK_CONF="$VK_DIR/vpskit.conf"
+VK_NODES="$VK_DIR/nodes.txt"
+VK_FWD="$VK_DIR/forwards.txt"
+VK_BAK="/var/backups/vpskit"
+VK_BIN="/usr/local/bin/vk"
+
+R='\033[31m'; G='\033[32m'; Y='\033[33m'; B='\033[36m'; N='\033[0m'
+ok()   { echo -e "${G}✓ $*${N}"; }
+warn() { echo -e "${Y}! $*${N}"; }
+err()  { echo -e "${R}✗ $*${N}"; }
+info() { echo -e "${B}$*${N}"; }
+line() { echo "------------------------------"; }
+pause(){ echo; read -rp "按回车继续..." _; }
+ask()  { local a; read -rp "$1" a; echo "$a"; }
+confirm(){ local a; read -rp "$1 [y/n]: " a; [[ "$a" == "y" || "$a" == "Y" ]]; }
+
+# ---------- 配置 ----------
+PORT_MIN=""; PORT_MAX=""; NAT=0; NAT_SAMEPORT=1; PUBLIC_HOST=""
+PANEL=""; PANEL_PORT=""; PANEL_PATH=""; PANEL_USER=""; PANEL_PASS=""
+PANEL_SCHEME="http"; API_TOKEN=""; SUB_PORT=""; SUB_PATH=""
+CONF_KEYS="PORT_MIN PORT_MAX NAT NAT_SAMEPORT PUBLIC_HOST PANEL PANEL_PORT PANEL_PATH PANEL_USER PANEL_PASS PANEL_SCHEME API_TOKEN SUB_PORT SUB_PATH"
+
+load_conf(){ [[ -f "$VK_CONF" ]] && . "$VK_CONF"; return 0; }
+save_conf(){
+  mkdir -p "$VK_DIR"; chmod 700 "$VK_DIR"
+  : > "$VK_CONF.tmp"
+  local k
+  for k in $CONF_KEYS; do printf '%s=%q\n' "$k" "${!k}" >> "$VK_CONF.tmp"; done
+  mv "$VK_CONF.tmp" "$VK_CONF"; chmod 600 "$VK_CONF"
+}
+
+need_root(){ [[ $EUID -eq 0 ]] || { err "请用 root 运行（先输入 sudo -i 再运行）"; exit 1; }; }
+
+install_deps(){
+  local miss="" c
+  for c in curl jq openssl qrencode wget tar ss; do
+    command -v "$c" >/dev/null 2>&1 || miss="$miss $c"
+  done
+  [[ -z "$miss" ]] && return 0
+  info "正在安装必要组件:$miss"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq openssl qrencode wget tar iproute2 >/dev/null 2>&1
+  else
+    err "只支持 Ubuntu/Debian 系统"; return 1
+  fi
+  for c in curl jq openssl; do
+    command -v "$c" >/dev/null 2>&1 || { err "组件 $c 安装失败，请检查网络"; return 1; }
+  done
+}
+
+self_install(){
+  if [[ -f "$0" && "$(readlink -f "$0")" != "$VK_BIN" ]]; then
+    cp -f "$0" "$VK_BIN" 2>/dev/null && chmod +x "$VK_BIN"
+  fi
+}
+
+# ---------- 基础工具 ----------
+arch_name(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *) echo unknown ;;
+  esac
+}
+port_in_use(){ ss -lntuH 2>/dev/null | awk '{print $5}' | grep -qE "[:.]$1\$"; }
+valid_port(){ [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+in_range(){
+  [[ -z "$PORT_MIN" ]] && return 0
+  (( $1 >= PORT_MIN && $1 <= PORT_MAX ))
+}
+pick_port(){
+  local lo=${PORT_MIN:-20000} hi=${PORT_MAX:-60000} p i
+  for i in $(seq 1 200); do
+    p=$(( lo + (RANDOM * 32768 + RANDOM) % (hi - lo + 1) ))
+    port_in_use "$p" || { echo "$p"; return 0; }
+  done
+  return 1
+}
+get_ip(){
+  local ip u
+  for u in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
+    ip=$(curl -4 -s -m 6 "$u" 2>/dev/null | tr -d '[:space:]')
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+  done
+  return 1
+}
+get_host(){
+  if [[ -z "$PUBLIC_HOST" ]]; then
+    PUBLIC_HOST=$(get_ip) || PUBLIC_HOST=""
+    [[ -n "$PUBLIC_HOST" ]] && save_conf
+  fi
+  echo "$PUBLIC_HOST"
+}
+ext_port(){
+  # NAT 机内外端口不一致时，询问外部端口
+  if [[ "$NAT" == "1" && "$NAT_SAMEPORT" == "0" ]]; then
+    local e
+    e=$(ask "内部端口 $1 对应的【外部端口】是多少: ")
+    valid_port "$e" && { echo "$e"; return; }
+  fi
+  echo "$1"
+}
+open_fw(){
+  local p=$1
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "$p" >/dev/null 2>&1 && ok "系统防火墙已放行端口 $p"
+  fi
+}
+gen_uuid(){ cat /proc/sys/kernel/random/uuid; }
+rand_str(){ openssl rand -hex "${1:-6}"; }
+b64url(){ base64 -w0 | tr '+/' '-_' | tr -d '='; }
+gen_x25519(){
+  # 输出: 私钥 公钥 (Reality 用的 base64url 格式)
+  local f; f=$(mktemp)
+  openssl genpkey -algorithm X25519 -out "$f" 2>/dev/null || { rm -f "$f"; return 1; }
+  local priv pub
+  priv=$(openssl pkey -in "$f" -outform DER 2>/dev/null | tail -c 32 | b64url)
+  pub=$(openssl pkey -in "$f" -pubout -outform DER 2>/dev/null | tail -c 32 | b64url)
+  rm -f "$f"
+  [[ ${#priv} -eq 43 && ${#pub} -eq 43 ]] || return 1
+  echo "$priv $pub"
+}
+pick_sni(){
+  local d
+  for d in addons.mozilla.org www.microsoft.com www.amazon.com; do
+    curl -sI --tlsv1.3 -m 5 "https://$d" >/dev/null 2>&1 && { echo "$d"; return; }
+  done
+  echo "www.microsoft.com"
+}
+show_link(){
+  local name=$1 link=$2
+  line; ok "节点: $name"
+  echo "$link"
+  echo
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t ANSIUTF8 -m 1 "$link"
+  fi
+  info "手机: 用代理软件扫上面的二维码，或复制链接导入"
+}
+save_node(){ mkdir -p "$VK_DIR"; echo "$1|$2|$3|$4" >> "$VK_NODES"; }
+
+# ---------- 备份 / 撤销 ----------
+backup_now(){
+  mkdir -p "$VK_BAK"
+  local f="$VK_BAK/$(date +%Y%m%d-%H%M%S)-${1:-manual}.tar.gz" paths=""
+  local p
+  for p in "$VK_DIR" /usr/local/s-ui/db /etc/x-ui; do [[ -e "$p" ]] && paths="$paths $p"; done
+  [[ -z "$paths" ]] && return 0
+  # shellcheck disable=SC2086
+  tar -czf "$f" $paths 2>/dev/null && echo "$f"
+  # 只保留最近 10 份
+  ls -1t "$VK_BAK"/*.tar.gz 2>/dev/null | tail -n +11 | xargs -r rm -f
+}
+menu_backup(){
+  clear; info "== 备份与撤销 =="
+  echo "1. 立即备份"
+  echo "2. 恢复到某个备份（撤销）"
+  echo "0. 返回"
+  case "$(ask '请选择: ')" in
+    1) local f; f=$(backup_now manual); [[ -n "$f" ]] && ok "已备份: $f" || warn "没有可备份的内容" ;;
+    2)
+      local list; mapfile -t list < <(ls -1t "$VK_BAK"/*.tar.gz 2>/dev/null)
+      [[ ${#list[@]} -eq 0 ]] && { warn "还没有备份"; pause; return; }
+      local i
+      for i in "${!list[@]}"; do echo "$((i+1)). $(basename "${list[$i]}")"; done
+      local n; n=$(ask "恢复第几个: ")
+      [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#list[@]} )) || { err "输入不对"; pause; return; }
+      confirm "确认恢复？当前配置会被覆盖" || return
+      backup_now before-restore >/dev/null
+      systemctl stop s-ui x-ui 2>/dev/null
+      tar -xzf "${list[$((n-1))]}" -C / && ok "已恢复" || err "恢复失败"
+      systemctl start s-ui 2>/dev/null; systemctl start x-ui 2>/dev/null
+      load_conf ;;
+  esac
+  pause
+}
+
+# ---------- 体检 ----------
+do_check(){
+  clear; info "== 开机体检 =="
+  . /etc/os-release 2>/dev/null
+  local virt mem disk ip arch
+  virt=$(systemd-detect-virt 2>/dev/null || echo unknown)
+  mem=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+  disk=$(df -h / | awk 'NR==2{print $4}')
+  arch=$(arch_name)
+  ip=$(get_ip) || ip=""
+  echo "系统: ${PRETTY_NAME:-未知}"
+  echo "架构: $arch   虚拟化: $virt"
+  echo "内存: ${mem}MB   剩余硬盘: $disk"
+  echo "公网IP: ${ip:-获取失败}"
+  line
+  case "${ID:-}" in
+    ubuntu|debian) ok "系统受支持" ;;
+    *) err "系统不受支持（只支持 Ubuntu/Debian）" ;;
+  esac
+  [[ "$arch" == "unknown" ]] && err "CPU 架构不受支持"
+  [[ -z "$ip" ]] && err "无法访问外网，请先检查网络"
+  (( mem < 200 )) && warn "内存很小，面板可能不稳定"
+  if [[ "$virt" == "lxc" || "$virt" == "openvz" ]]; then
+    warn "这是容器型机器：BBR 加速、WARP 等功能可能用不了"
+  fi
+  if [[ -n "$ip" ]] && ! ip -4 addr 2>/dev/null | grep -q "inet $ip/"; then
+    warn "网卡上没有这个公网IP：可能是 NAT 机"
+    echo "  （部分云厂商的普通机器也会这样，不一定是 NAT）"
+  fi
+  curl -s -m 8 -o /dev/null https://github.com && ok "能访问 GitHub（下载面板需要）" \
+    || err "访问不了 GitHub，装面板会失败"
+  if [[ -n "$PORT_MIN" ]]; then
+    echo "已设置可用端口范围: $PORT_MIN-$PORT_MAX"
+  fi
+}
+
+# ---------- 端口范围 (NAT) ----------
+set_ports(){
+  clear; info "== 机器类型与端口 =="
+  echo "1. 普通机器（端口随便用）"
+  echo "2. NAT 机（商家只给一段端口）"
+  case "$(ask '请选择: ')" in
+    1) NAT=0; NAT_SAMEPORT=1; PORT_MIN=""; PORT_MAX="" ;;
+    2)
+      NAT=1
+      echo "请看商家后台给你的端口范围，例如 10000-10020"
+      local r; r=$(ask "端口范围: ")
+      if [[ "$r" =~ ^([0-9]+)-([0-9]+)$ ]] && valid_port "${BASH_REMATCH[1]}" \
+         && valid_port "${BASH_REMATCH[2]}" && (( BASH_REMATCH[1] <= BASH_REMATCH[2] )); then
+        PORT_MIN=${BASH_REMATCH[1]}; PORT_MAX=${BASH_REMATCH[2]}
+      else
+        err "格式不对，应为 起始-结束"; pause; return 1
+      fi
+      echo "外部端口和机器内部端口是同一个数字吗？"
+      echo "（多数商家是同一个。不确定就选 y）"
+      if confirm "是同一个"; then NAT_SAMEPORT=1; else NAT_SAMEPORT=0; fi ;;
+    *) return 1 ;;
+  esac
+  local h; h=$(get_ip) || h=""
+  echo "检测到的公网IP: ${h:-无}"
+  echo "如果商家给的是另一个IP或域名，请输入；否则直接回车"
+  local c; c=$(ask "连接地址: ")
+  PUBLIC_HOST=${c:-$h}
+  save_conf; ok "已保存"
+}
+
+# ---------- 面板 ----------
+panel_installed(){
+  [[ -x /usr/local/s-ui/sui ]] && { echo sui; return; }
+  [[ -x /usr/local/x-ui/x-ui ]] && { echo xui; return; }
+  echo ""
+}
+panel_service(){ [[ "$PANEL" == "sui" ]] && echo s-ui || echo x-ui; }
+panel_url(){
+  local h; h=$(get_host)
+  local p; p=$(ext_port_quiet "$PANEL_PORT")
+  echo "${PANEL_SCHEME}://${h}:${p}/${PANEL_PATH:+$PANEL_PATH/}"
+}
+ext_port_quiet(){ echo "$1"; }
+
+show_panel(){
+  [[ -z "$PANEL" ]] && { warn "还没装面板"; return 1; }
+  line
+  echo "面板: $([[ "$PANEL" == "sui" ]] && echo s-ui || echo 3x-ui)"
+  echo "地址: $(panel_url)"
+  echo "账号: $PANEL_USER"
+  echo "密码: $PANEL_PASS"
+  [[ "$NAT" == "1" && "$NAT_SAMEPORT" == "0" ]] && warn "NAT 机: 地址里的端口要换成对应的外部端口"
+  line
+}
+
+download(){
+  # download URL 目标文件
+  wget -q --timeout=30 --tries=2 -O "$2" "$1" && [[ -s "$2" ]]
+}
+
+install_panel(){
+  clear; info "== 安装面板 =="
+  local cur; cur=$(panel_installed)
+  if [[ -n "$cur" ]]; then
+    warn "本机已装有面板: $([[ "$cur" == "sui" ]] && echo s-ui || echo 3x-ui)"
+    echo "一台机器只装一个面板。"
+    if [[ -z "$PANEL" ]]; then
+      confirm "要让本工具接管这个面板（会重设端口、账号、密码）吗" || return 1
+      PANEL=$cur; configure_panel; return $?
+    fi
+    show_panel; return 0
+  fi
+  echo "1. s-ui   （sing-box 内核，支持 Hysteria2）"
+  echo "2. 3x-ui  （Xray 内核，用的人最多）"
+  echo "0. 返回"
+  local c; c=$(ask "请选择: ")
+  local arch; arch=$(arch_name)
+  [[ "$arch" == "unknown" ]] && { err "CPU 架构不支持"; return 1; }
+  local tmp; tmp=$(mktemp -d)
+  case "$c" in
+    1)
+      info "正在下载 s-ui ..."
+      download "https://github.com/alireza0/s-ui/releases/latest/download/s-ui-linux-${arch}.tar.gz" "$tmp/p.tar.gz" \
+        || { err "下载失败：服务器连不上 GitHub，稍后再试"; rm -rf "$tmp"; return 1; }
+      tar -xzf "$tmp/p.tar.gz" -C "$tmp" || { err "解压失败"; rm -rf "$tmp"; return 1; }
+      [[ -f "$tmp/s-ui/sui" ]] || { err "安装包结构和预期不同，请把这句话发给开发者"; rm -rf "$tmp"; return 1; }
+      chmod +x "$tmp/s-ui/sui" "$tmp/s-ui/s-ui.sh" 2>/dev/null
+      [[ -f "$tmp/s-ui/s-ui.sh" ]] && cp -f "$tmp/s-ui/s-ui.sh" /usr/bin/s-ui
+      cp -rf "$tmp/s-ui" /usr/local/
+      cp -f "$tmp"/s-ui/*.service /etc/systemd/system/ 2>/dev/null
+      systemctl daemon-reload
+      systemctl enable s-ui --now >/dev/null 2>&1
+      PANEL=sui ;;
+    2)
+      info "正在下载 3x-ui ..."
+      download "https://github.com/MHSanaei/3x-ui/releases/latest/download/x-ui-linux-${arch}.tar.gz" "$tmp/p.tar.gz" \
+        || { err "下载失败：服务器连不上 GitHub，稍后再试"; rm -rf "$tmp"; return 1; }
+      tar -xzf "$tmp/p.tar.gz" -C "$tmp" || { err "解压失败"; rm -rf "$tmp"; return 1; }
+      [[ -f "$tmp/x-ui/x-ui" ]] || { err "安装包结构和预期不同，请把这句话发给开发者"; rm -rf "$tmp"; return 1; }
+      chmod +x "$tmp/x-ui/x-ui" "$tmp/x-ui/x-ui.sh" "$tmp"/x-ui/bin/xray-linux-* 2>/dev/null
+      [[ -f "$tmp/x-ui/x-ui.sh" ]] && cp -f "$tmp/x-ui/x-ui.sh" /usr/bin/x-ui
+      local svc=""
+      for svc in "$tmp/x-ui/x-ui.service" "$tmp/x-ui/x-ui.service.debian"; do
+        [[ -f "$svc" ]] && { cp -f "$svc" /etc/systemd/system/x-ui.service; break; }
+      done
+      [[ -f /etc/systemd/system/x-ui.service ]] || { err "安装包里没找到服务文件，请把这句话发给开发者"; rm -rf "$tmp"; return 1; }
+      rm -rf /usr/local/x-ui; mv "$tmp/x-ui" /usr/local/
+      systemctl daemon-reload
+      systemctl enable x-ui >/dev/null 2>&1
+      systemctl restart x-ui
+      PANEL=xui ;;
+    *) rm -rf "$tmp"; return 1 ;;
+  esac
+  rm -rf "$tmp"
+  sleep 2
+  configure_panel
+}
+
+configure_panel(){
+  info "正在设置面板端口、账号和密码 ..."
+  PANEL_PORT=$(pick_port) || { err "端口范围内没有空闲端口"; return 1; }
+  PANEL_USER="u$(rand_str 3)"
+  PANEL_PASS="$(rand_str 8)"
+  PANEL_PATH="$(rand_str 4)"
+  API_TOKEN=""
+  if [[ "$PANEL" == "sui" ]]; then
+    SUB_PORT=$(pick_port); SUB_PATH="$(rand_str 4)"
+    /usr/local/s-ui/sui setting -port "$PANEL_PORT" -path "/$PANEL_PATH/" \
+        -subPort "$SUB_PORT" -subPath "/$SUB_PATH/" >/dev/null 2>&1 \
+      || warn "设置端口的命令返回了错误"
+    /usr/local/s-ui/sui admin -username "$PANEL_USER" -password "$PANEL_PASS" >/dev/null 2>&1 \
+      || warn "设置账号的命令返回了错误"
+    systemctl restart s-ui
+    PANEL_SCHEME=http
+    open_fw "$SUB_PORT"
+  else
+    /usr/local/x-ui/x-ui setting -username "$PANEL_USER" -password "$PANEL_PASS" \
+        -port "$PANEL_PORT" -webBasePath "$PANEL_PATH" >/dev/null 2>&1 \
+      || warn "设置面板的命令返回了错误"
+    systemctl restart x-ui
+    sleep 2
+    detect_scheme
+  fi
+  open_fw "$PANEL_PORT"
+  save_conf
+  sleep 2
+  if port_in_use "$PANEL_PORT"; then
+    ok "面板已启动"
+  else
+    err "面板没有在端口 $PANEL_PORT 上启动，请运行【一键排查】"
+  fi
+  show_panel
+  warn "请截图保存上面的地址、账号、密码"
+}
+
+detect_scheme(){
+  local code
+  code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' "https://127.0.0.1:${PANEL_PORT}/${PANEL_PATH:+$PANEL_PATH/}")
+  if [[ "$code" != "000" ]]; then PANEL_SCHEME=https; else PANEL_SCHEME=http; fi
+}
+
+# ---------- 面板 API ----------
+sui_base(){ echo "http://127.0.0.1:${PANEL_PORT}/${PANEL_PATH:+$PANEL_PATH/}apiv2"; }
+sui_get(){ curl -s -m 15 -H "Token: $API_TOKEN" "$(sui_base)/$1"; }
+sui_save(){
+  # sui_save 对象 动作 JSON
+  curl -s -m 20 -X POST -H "Token: $API_TOKEN" \
+    --data-urlencode "object=$1" --data-urlencode "action=$2" \
+    --data-urlencode "data=$3" "$(sui_base)/save"
+}
+sui_find_id(){
+  # sui_find_id 接口 字段 值
+  sui_get "$1" | jq -r --arg k "$2" --arg v "$3" \
+    '[.. | objects | select(has($k) and .[$k] == $v) | .id] | map(select(. != null)) | first // empty' 2>/dev/null
+}
+sui_ok(){ [[ "$(echo "$1" | jq -r '.success' 2>/dev/null)" == "true" ]]; }
+
+sui_token(){
+  if [[ -n "$API_TOKEN" ]]; then
+    sui_ok "$(sui_get inbounds)" && return 0
+    warn "保存的令牌已失效，需要重新获取"
+  fi
+  line
+  info "s-ui 需要你在面板里创建一次“API 令牌”"
+  echo "只需做这一次，之后都是自动的："
+  echo "1) 用浏览器打开面板并登录"
+  show_panel
+  echo "2) 进入 管理员(Admins) 页面"
+  echo "3) 新建 API Token，有效期选最长"
+  echo "4) 复制生成的那串字符，粘贴到这里"
+  local t; t=$(ask "粘贴令牌: ")
+  t=$(echo "$t" | tr -d '[:space:]')
+  [[ -z "$t" ]] && return 1
+  API_TOKEN=$t
+  if sui_ok "$(sui_get inbounds)"; then
+    save_conf; ok "令牌有效，已保存"
+  else
+    API_TOKEN=""; err "令牌无效，请重新复制后再试"; return 1
+  fi
+}
+
+xui_base(){ echo "${PANEL_SCHEME}://127.0.0.1:${PANEL_PORT}/${PANEL_PATH:+$PANEL_PATH/}panel/api"; }
+xui_get(){ curl -sk -m 15 -H "Authorization: Bearer $API_TOKEN" "$(xui_base)/$1"; }
+xui_post(){
+  curl -sk -m 20 -X POST -H "Authorization: Bearer $API_TOKEN" \
+    -H "Content-Type: application/json" -d "$2" "$(xui_base)/$1"
+}
+xui_token(){
+  detect_scheme
+  if [[ -n "$API_TOKEN" ]]; then
+    [[ "$(xui_get inbounds/list | jq -r '.success' 2>/dev/null)" == "true" ]] && return 0
+  fi
+  API_TOKEN=$(/usr/local/x-ui/x-ui setting -getApiToken true 2>/dev/null \
+      | grep -Eo 'apiToken: .+' | awk '{print $2}')
+  if [[ -z "$API_TOKEN" ]]; then
+    err "没能从 3x-ui 取得 API 令牌（可能版本太旧）"; return 1
+  fi
+  save_conf
+  sleep 1
+  if [[ "$(xui_get inbounds/list | jq -r '.success' 2>/dev/null)" == "true" ]]; then
+    return 0
+  fi
+  err "令牌取到了，但面板接口没有正常响应，请运行【一键排查】"; return 1
+}
+
+# ---------- 建节点 ----------
+node_done(){
+  # node_done 名称 协议 端口 链接 [udp]
+  local name=$1 proto=$2 port=$3 link=$4
+  open_fw "$port"
+  save_node "$name" "$proto" "$port" "$link"
+  sleep 2
+  if port_in_use "$port"; then
+    ok "端口 $port 已在监听，节点搭建成功"
+  else
+    warn "端口 $port 还没监听，正在重启面板再试 ..."
+    systemctl restart "$(panel_service)"; sleep 4
+    port_in_use "$port" && ok "重启后正常了" || err "仍未监听，请运行【一键排查】并把诊断报告发给开发者"
+  fi
+  show_link "$name" "$link"
+}
+
+sui_vless_reality(){
+  local port uuid keys priv pub sid sni tag host eport r tls_id in_id
+  port=$(pick_port) || { err "没有空闲端口"; return 1; }
+  uuid=$(gen_uuid); sid=$(openssl rand -hex 4); sni=$(pick_sni)
+  keys=$(gen_x25519) || { err "生成密钥失败"; return 1; }
+  priv=${keys% *}; pub=${keys#* }
+  tag="vk-vless-$port"
+  r=$(sui_save tls new "$(jq -cn --arg n "$tag" --arg sni "$sni" --arg priv "$priv" --arg pub "$pub" --arg sid "$sid" \
+    '{name:$n,
+      server:{enabled:true,server_name:$sni,
+              reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$priv,short_id:[$sid]}},
+      client:{utls:{enabled:true,fingerprint:"chrome"},reality:{public_key:$pub,short_id:$sid}}}')")
+  sui_ok "$r" || { err "创建 TLS 配置失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  tls_id=$(sui_find_id tls name "$tag")
+  [[ -z "$tls_id" ]] && { err "找不到刚创建的 TLS 配置"; return 1; }
+  r=$(sui_save inbounds new "$(jq -cn --arg t "$tag" --argjson p "$port" --argjson tid "$tls_id" \
+    '{type:"vless",tag:$t,listen:"::",listen_port:$p,tls_id:$tid,addrs:[],out_json:{}}')")
+  sui_ok "$r" || { err "创建入站失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  in_id=$(sui_find_id inbounds tag "$tag")
+  [[ -z "$in_id" ]] && { err "找不到刚创建的入站"; return 1; }
+  r=$(sui_save clients new "$(jq -cn --arg n "$tag" --arg u "$uuid" --argjson i "$in_id" \
+    '{enable:true,name:$n,inbounds:[$i],links:[],volume:0,expiry:0,
+      config:{vless:{name:$n,uuid:$u,flow:"xtls-rprx-vision"}}}')")
+  sui_ok "$r" || { err "创建用户失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  host=$(get_host); eport=$(ext_port "$port")
+  node_done "$tag" "vless-reality" "$port" \
+    "vless://${uuid}@${host}:${eport}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp#${tag}"
+}
+
+sui_hysteria2(){
+  local port pass tag host eport r tls_id in_id cdir="$VK_DIR/cert" sni="bing.com"
+  port=$(pick_port) || { err "没有空闲端口"; return 1; }
+  pass=$(rand_str 12); tag="vk-hy2-$port"
+  mkdir -p "$cdir"
+  if [[ ! -f "$cdir/self.crt" ]]; then
+    openssl ecparam -genkey -name prime256v1 -out "$cdir/self.key" 2>/dev/null
+    openssl req -new -x509 -days 3650 -key "$cdir/self.key" -out "$cdir/self.crt" -subj "/CN=$sni" 2>/dev/null \
+      || { err "生成自签证书失败"; return 1; }
+    chmod 644 "$cdir/self.crt" "$cdir/self.key"
+  fi
+  r=$(sui_save tls new "$(jq -cn --arg n "$tag" --arg sni "$sni" --arg c "$cdir/self.crt" --arg k "$cdir/self.key" \
+    '{name:$n,
+      server:{enabled:true,server_name:$sni,alpn:["h3"],certificate_path:$c,key_path:$k},
+      client:{insecure:true}}')")
+  sui_ok "$r" || { err "创建 TLS 配置失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  tls_id=$(sui_find_id tls name "$tag")
+  [[ -z "$tls_id" ]] && { err "找不到刚创建的 TLS 配置"; return 1; }
+  r=$(sui_save inbounds new "$(jq -cn --arg t "$tag" --argjson p "$port" --argjson tid "$tls_id" \
+    '{type:"hysteria2",tag:$t,listen:"::",listen_port:$p,tls_id:$tid,addrs:[],out_json:{}}')")
+  sui_ok "$r" || { err "创建入站失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  in_id=$(sui_find_id inbounds tag "$tag")
+  [[ -z "$in_id" ]] && { err "找不到刚创建的入站"; return 1; }
+  r=$(sui_save clients new "$(jq -cn --arg n "$tag" --arg pw "$pass" --argjson i "$in_id" \
+    '{enable:true,name:$n,inbounds:[$i],links:[],volume:0,expiry:0,
+      config:{hysteria2:{name:$n,password:$pw}}}')")
+  sui_ok "$r" || { err "创建用户失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  host=$(get_host); eport=$(ext_port "$port")
+  warn "Hysteria2 走 UDP：NAT 机需确认商家的端口同时支持 UDP"
+  node_done "$tag" "hysteria2" "$port" \
+    "hysteria2://${pass}@${host}:${eport}/?insecure=1&sni=${sni}#${tag}"
+}
+
+xui_fix_link(){
+  # 把面板返回链接里的本机地址换成公网地址
+  local host=$1 port=$2 eport=$3
+  sed -E "s#@(127\.0\.0\.1|localhost|\[::1\]):${port}#@${host}:${eport}#"
+}
+xui_finish(){
+  # xui_finish 返回JSON 名称 协议 端口 校验串 自建链接 邮箱
+  local r=$1 name=$2 proto=$3 port=$4 probe=$5 mylink=$6 email=$7 id link host eport
+  if [[ "$(echo "$r" | jq -r '.success' 2>/dev/null)" != "true" ]]; then
+    err "创建入站失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"
+    [[ -z "$r" ]] && err "面板没有返回内容，请运行【一键排查】"
+    return 1
+  fi
+  id=$(echo "$r" | jq -r '.obj.id // empty' 2>/dev/null)
+  link=$mylink
+  if [[ -n "$id" ]] && ! xui_get "inbounds/get/$id" | grep -q "$probe"; then
+    # 新版面板的用户需单独创建，改用面板生成的链接
+    xui_post clients/add "$(jq -cn --arg e "$email" --argjson i "$id" \
+      '{client:{email:$e,enable:true},inboundIds:[$i]}')" >/dev/null
+    host=$(get_host); eport=${mylink##*:}; eport=${eport%%[?/#]*}
+    local got
+    got=$(xui_get "clients/links/$email" | jq -r '.. | strings' 2>/dev/null \
+          | grep -E '^(vless|ss|trojan|vmess)://' | head -n1 | xui_fix_link "$host" "$port" "$eport")
+    [[ -n "$got" ]] && link=$got || warn "没能取到面板生成的链接，下面的链接可能需要到面板里核对"
+  fi
+  node_done "$name" "$proto" "$port" "$link"
+}
+
+xui_vless_reality(){
+  local port uuid keys priv pub sid sni name email host eport r
+  port=$(pick_port) || { err "没有空闲端口"; return 1; }
+  uuid=$(gen_uuid); sid=$(openssl rand -hex 4); sni=$(pick_sni)
+  keys=$(gen_x25519) || { err "生成密钥失败"; return 1; }
+  priv=${keys% *}; pub=${keys#* }
+  name="vk-vless-$port"; email="vk$port"
+  r=$(xui_post inbounds/add "$(jq -cn --arg rm "$name" --argjson p "$port" --arg u "$uuid" --arg e "$email" \
+      --arg sni "$sni" --arg priv "$priv" --arg pub "$pub" --arg sid "$sid" \
+    '{enable:true,remark:$rm,listen:"",port:$p,protocol:"vless",expiryTime:0,total:0,
+      settings:{clients:[{id:$u,email:$e,flow:"xtls-rprx-vision",enable:true}],decryption:"none"},
+      streamSettings:{network:"tcp",security:"reality",
+        realitySettings:{show:false,xver:0,dest:($sni+":443"),target:($sni+":443"),serverNames:[$sni],
+          privateKey:$priv,shortIds:[$sid],
+          settings:{publicKey:$pub,fingerprint:"chrome",serverName:"",spiderX:"/"}},
+        tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}},
+      sniffing:{enabled:true,destOverride:["http","tls","quic"]}}')")
+  host=$(get_host); eport=$(ext_port "$port")
+  xui_finish "$r" "$name" "vless-reality" "$port" "$uuid" \
+    "vless://${uuid}@${host}:${eport}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&spx=%2F&type=tcp#${name}" "$email"
+}
+
+xui_ss2022(){
+  local port spw cpw name email host eport r method="2022-blake3-aes-128-gcm" ui
+  port=$(pick_port) || { err "没有空闲端口"; return 1; }
+  spw=$(openssl rand -base64 16); cpw=$(openssl rand -base64 16)
+  name="vk-ss-$port"; email="vk$port"
+  r=$(xui_post inbounds/add "$(jq -cn --arg rm "$name" --argjson p "$port" --arg m "$method" \
+      --arg spw "$spw" --arg cpw "$cpw" --arg e "$email" \
+    '{enable:true,remark:$rm,listen:"",port:$p,protocol:"shadowsocks",expiryTime:0,total:0,
+      settings:{method:$m,password:$spw,network:"tcp,udp",
+        clients:[{method:"",password:$cpw,email:$e,enable:true}]},
+      streamSettings:{network:"tcp",security:"none",
+        tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}},
+      sniffing:{enabled:true,destOverride:["http","tls","quic"]}}')")
+  host=$(get_host); eport=$(ext_port "$port")
+  ui=$(printf '%s' "${method}:${spw}:${cpw}" | b64url)
+  warn "Shadowsocks 直接过境容易被识别，建议只放在中转后面用"
+  xui_finish "$r" "$name" "ss2022" "$port" "$cpw" "ss://${ui}@${host}:${eport}#${name}" "$email"
+}
+
+menu_node(){
+  clear; info "== 一键搭建节点 =="
+  [[ -z "$PANEL" ]] && { warn "请先安装面板"; pause; return; }
+  if [[ "$PANEL" == "sui" ]]; then
+    echo "1. VLESS + Reality  [推荐]"
+    echo "   优点: 不要域名证书，伪装强，NAT 机可用"
+    echo "   缺点: 线路差时速度一般"
+    echo "2. Hysteria2"
+    echo "   优点: 线路差时提速明显"
+    echo "   缺点: 走 UDP，可能被限速，部分 NAT 机不支持"
+  else
+    echo "1. VLESS + Reality  [推荐]"
+    echo "   优点: 不要域名证书，伪装强，NAT 机可用"
+    echo "   缺点: 线路差时速度一般"
+    echo "2. Shadowsocks 2022"
+    echo "   优点: 轻量省资源，适合放中转后面"
+    echo "   缺点: 直接过境容易被识别"
+  fi
+  echo "0. 返回"
+  local c; c=$(ask "请选择: ")
+  [[ "$c" == "1" || "$c" == "2" ]] || return
+  if [[ "$PANEL" == "sui" ]]; then sui_token || { pause; return; }
+  else xui_token || { pause; return; }; fi
+  backup_now before-node >/dev/null
+  case "$PANEL:$c" in
+    sui:1) sui_vless_reality ;;
+    sui:2) sui_hysteria2 ;;
+    xui:1) xui_vless_reality ;;
+    xui:2) xui_ss2022 ;;
+  esac
+  pause
+}
+
+list_nodes(){
+  clear; info "== 我的节点 =="
+  [[ -s "$VK_NODES" ]] || { warn "还没有通过本工具创建的节点"; pause; return; }
+  local i=0 name proto port link
+  while IFS='|' read -r name proto port link; do
+    i=$((i+1)); echo "$i. $name  ($proto, 端口 $port)"
+  done < "$VK_NODES"
+  local n; n=$(ask "输入序号查看链接和二维码（回车返回）: ")
+  [[ "$n" =~ ^[0-9]+$ ]] || return
+  local l; l=$(sed -n "${n}p" "$VK_NODES")
+  [[ -z "$l" ]] && return
+  IFS='|' read -r name proto port link <<< "$l"
+  show_link "$name" "$link"; pause
+}
+
+# ---------- 中转 (realm 纯端口转发) ----------
+realm_install(){
+  [[ -x /usr/local/bin/realm ]] && return 0
+  local a tmp
+  case "$(uname -m)" in
+    x86_64|amd64) a=x86_64 ;;
+    aarch64|arm64) a=aarch64 ;;
+    *) err "CPU 架构不支持"; return 1 ;;
+  esac
+  tmp=$(mktemp -d)
+  info "正在下载转发程序 realm ..."
+  download "https://github.com/zhboner/realm/releases/latest/download/realm-${a}-unknown-linux-gnu.tar.gz" "$tmp/r.tar.gz" \
+    && tar -xzf "$tmp/r.tar.gz" -C "$tmp" && [[ -f "$tmp/realm" ]] \
+    || { err "下载 realm 失败，稍后再试"; rm -rf "$tmp"; return 1; }
+  install -m 755 "$tmp/realm" /usr/local/bin/realm; rm -rf "$tmp"
+  cat > /etc/systemd/system/vpskit-realm.service <<'EOF'
+[Unit]
+Description=vpskit realm port forward
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/realm -c /etc/vpskit/realm.toml
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+realm_apply(){
+  mkdir -p "$VK_DIR"
+  {
+    echo '[network]'; echo 'no_tcp = false'; echo 'use_udp = true'
+    local lp rh rp
+    while IFS='|' read -r lp rh rp; do
+      [[ -z "$lp" ]] && continue
+      echo; echo '[[endpoints]]'
+      echo "listen = \"0.0.0.0:$lp\""
+      echo "remote = \"$rh:$rp\""
+    done < "$VK_FWD"
+  } > "$VK_DIR/realm.toml"
+  if [[ -s "$VK_FWD" ]]; then
+    systemctl enable vpskit-realm >/dev/null 2>&1
+    systemctl restart vpskit-realm
+  else
+    systemctl disable vpskit-realm --now >/dev/null 2>&1
+  fi
+}
+relink(){
+  # relink 链接 新地址 新端口  -> 把节点链接指向中转机
+  echo "$1" | sed -E "s#@[^:@/?\#]+:[0-9]+#@$2:$3#"
+}
+fwd_add(){
+  touch "$VK_FWD"
+  info "这台机器将作为【中转机】"
+  local rh rp lp
+  rh=$(ask "落地机的 IP: ")
+  rp=$(ask "落地机上节点的端口: ")
+  [[ -n "$rh" ]] && valid_port "$rp" || { err "输入不对"; return 1; }
+  lp=$(pick_port) || { err "没有空闲端口"; return 1; }
+  realm_install || return 1
+  backup_now before-forward >/dev/null
+  echo "$lp|$rh|$rp" >> "$VK_FWD"
+  realm_apply; open_fw "$lp"; sleep 1
+  if port_in_use "$lp"; then ok "转发已生效: 本机 $lp -> $rh:$rp"
+  else err "转发没有启动，请运行【一键排查】"; return 1; fi
+  local host eport link
+  host=$(get_host); eport=$(ext_port "$lp")
+  echo "把落地机的节点链接粘贴到这里，自动生成中转版链接"
+  link=$(ask "节点链接（没有就回车跳过）: ")
+  if [[ -n "$link" ]]; then
+    local nl; nl=$(relink "$link" "$host" "$eport")
+    save_node "relay-$lp" "relay" "$lp" "$nl"
+    show_link "中转-$lp" "$nl"
+  else
+    echo "手动改法: 把节点里的地址改成 $host，端口改成 $eport"
+  fi
+}
+fwd_del(){
+  [[ -s "$VK_FWD" ]] || { warn "没有转发规则"; return; }
+  nl -w1 -s'. ' "$VK_FWD" | sed 's/|/ -> /; s/|/:/'
+  local n; n=$(ask "删除第几条: ")
+  [[ "$n" =~ ^[0-9]+$ ]] || return
+  sed -i "${n}d" "$VK_FWD"; realm_apply; ok "已删除"
+}
+menu_relay(){
+  clear; info "== 中转 / 端口转发 =="
+  echo "1. 纯端口转发  [推荐，NAT 机可用]"
+  echo "   优点: 最简单，延迟最低，最省资源"
+  echo "   缺点: 过境段无额外保护"
+  echo "   适合: 专线或线路好的中转机"
+  echo "2. 加密隧道中转  (下一版)"
+  echo "   优点: 过境多一层伪装，更抗封"
+  echo "   缺点: 两端都要配置，速度略损耗"
+  echo "3. 链式代理  (下一版)"
+  echo "   优点: 面板里管理，可在中转机分流"
+  echo "   缺点: 最占资源，不适合小 NAT 机"
+  line
+  echo "4. 查看已有转发"
+  echo "5. 删除转发"
+  echo "0. 返回"
+  case "$(ask '请选择: ')" in
+    1) fwd_add ;;
+    2|3) warn "这个组合在下一版加入" ;;
+    4) [[ -s "$VK_FWD" ]] && nl -w1 -s'. ' "$VK_FWD" | sed 's/|/ -> /; s/|/:/' || warn "没有转发规则" ;;
+    5) fwd_del ;;
+    *) return ;;
+  esac
+  pause
+}
+
+# ---------- 被墙检测 ----------
+check_block(){
+  clear; info "== 检测 IP / 端口是否被墙 =="
+  local host port
+  host=$(get_host)
+  [[ -z "$host" ]] && { err "拿不到公网IP"; pause; return; }
+  if [[ -s "$VK_NODES" ]]; then
+    echo "已有节点端口:"; awk -F'|' '{print "  "$3"  ("$1")"}' "$VK_NODES"
+  fi
+  port=$(ask "要检测的端口: ")
+  valid_port "$port" || { err "端口不对"; pause; return; }
+  echo "检测对象: $host:$port"
+  line
+  echo "[1/3] 本机是否在监听"
+  if port_in_use "$port"; then ok "端口在监听"
+  else err "本机没有程序在用这个端口 → 不是被墙，是服务没起来，请运行【一键排查】"; pause; return; fi
+  if grep -qE "\|hysteria2\|${port}\|" "$VK_NODES" 2>/dev/null; then
+    warn "这是 UDP 节点，下面的 TCP 检测对它不适用"
+  fi
+  echo "[2/3] 从国外多个地点连接测试"
+  local r id res total good
+  r=$(curl -s -m 15 -H 'Accept: application/json' "https://check-host.net/check-tcp?host=${host}:${port}&max_nodes=8")
+  id=$(echo "$r" | jq -r '.request_id // empty' 2>/dev/null)
+  if [[ -z "$id" ]]; then
+    warn "国外检测服务暂时不可用，跳过这一步"
+  else
+    sleep 8
+    res=$(curl -s -m 15 -H 'Accept: application/json' "https://check-host.net/check-result/$id")
+    total=$(echo "$res" | jq 'length' 2>/dev/null)
+    good=$(echo "$res" | jq '[.[] | select(. != null) | .[0] | select(type=="object" and .time != null)] | length' 2>/dev/null)
+    echo "国外检测点: ${good:-0} / ${total:-0} 个能连上"
+    if [[ "${good:-0}" -ge 1 ]]; then ok "国外能连上 → 服务器本身正常"
+    else err "国外也连不上 → 多半是商家后台的防火墙/安全组没放行端口 $port，或 NAT 端口映射不对"; fi
+  fi
+  echo "[3/3] 从国内测试（需要你动手一步）"
+  echo "手机【关掉代理】后，用浏览器打开 itdog.cn"
+  echo "选择 TCPing，输入:  $host:$port"
+  line
+  info "怎么看结果:"
+  echo "国外通 + 国内通   → 正常"
+  echo "国外通 + 国内不通 → 被墙"
+  echo "   只这个端口不通: 换端口（重建节点）"
+  echo "   所有端口都不通: IP 被墙，找商家换 IP 或走中转"
+  echo "国外不通          → 不是被墙，是服务器这边的问题"
+  warn "自动的国内检测将在下一版加入（借助你的国内中转机）"
+  pause
+}
+
+# ---------- 排查与修复 ----------
+diagnose(){
+  clear; info "== 一键排查并修复 =="
+  local fixed=0 bad=0 svc
+  # 网络
+  if curl -s -m 8 -o /dev/null https://www.cloudflare.com; then ok "外网连接正常"
+  else err "服务器访问不了外网（请联系商家）"; bad=$((bad+1)); fi
+  if getent hosts github.com >/dev/null 2>&1; then ok "域名解析正常"
+  else
+    warn "域名解析失败，尝试修复 ..."
+    if [[ ! -L /etc/resolv.conf ]]; then
+      cp -f /etc/resolv.conf /etc/resolv.conf.vkbak 2>/dev/null
+      printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+      getent hosts github.com >/dev/null 2>&1 && { ok "已修复"; fixed=$((fixed+1)); } || { err "修复失败"; bad=$((bad+1)); }
+    else err "需要手动处理 DNS，请把诊断报告发给开发者"; bad=$((bad+1)); fi
+  fi
+  # 时间
+  if command -v timedatectl >/dev/null 2>&1; then
+    if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then ok "系统时间已同步"
+    else
+      timedatectl set-ntp true >/dev/null 2>&1
+      warn "系统时间未同步，已尝试开启自动同步（时间不准会导致节点连不上）"; fixed=$((fixed+1))
+    fi
+  fi
+  # 硬盘
+  local use; use=$(df / | awk 'NR==2{gsub("%","",$5); print $5}')
+  if (( use >= 95 )); then err "硬盘快满了 (${use}%)，面板可能无法保存"; bad=$((bad+1)); else ok "硬盘空间够用 (${use}%)"; fi
+  # 面板
+  if [[ -n "$PANEL" ]]; then
+    svc=$(panel_service)
+    if systemctl is-active --quiet "$svc"; then ok "面板服务在运行"
+    else
+      warn "面板服务没在运行，正在重启 ..."
+      systemctl restart "$svc"; sleep 3
+      if systemctl is-active --quiet "$svc"; then ok "已重启成功"; fixed=$((fixed+1))
+      else
+        err "面板启动失败，最近的错误日志:"; bad=$((bad+1))
+        journalctl -u "$svc" -n 8 --no-pager 2>/dev/null | cut -c1-200
+      fi
+    fi
+    if port_in_use "$PANEL_PORT"; then ok "面板端口 $PANEL_PORT 正常"
+    else err "面板端口 $PANEL_PORT 没有监听"; bad=$((bad+1)); fi
+    if [[ -n "$PORT_MIN" ]] && ! in_range "$PANEL_PORT"; then
+      err "面板端口不在 NAT 可用范围内，外面访问不到 → 请重新运行【安装面板】"; bad=$((bad+1))
+    fi
+  else
+    warn "还没安装面板"
+  fi
+  # 节点端口
+  if [[ -s "$VK_NODES" ]]; then
+    local name proto port link down=0
+    while IFS='|' read -r name proto port link; do
+      [[ "$proto" == "relay" ]] && continue
+      if port_in_use "$port"; then ok "节点 $name 端口正常"
+      else err "节点 $name 端口 $port 没有监听"; down=1; fi
+    done < "$VK_NODES"
+    if (( down )) && [[ -n "$PANEL" ]]; then
+      warn "尝试重启面板来恢复节点 ..."
+      systemctl restart "$(panel_service)"; sleep 4
+      local still=0
+      while IFS='|' read -r name proto port link; do
+        [[ "$proto" == "relay" ]] && continue
+        port_in_use "$port" || still=1
+      done < "$VK_NODES"
+      if (( still )); then err "仍有节点没恢复（可能在面板里被删了）"; bad=$((bad+1))
+      else ok "节点已恢复"; fixed=$((fixed+1)); fi
+    fi
+  fi
+  # 转发
+  if [[ -s "$VK_FWD" ]]; then
+    if systemctl is-active --quiet vpskit-realm; then ok "中转转发在运行"
+    else
+      systemctl restart vpskit-realm; sleep 1
+      systemctl is-active --quiet vpskit-realm && { ok "中转转发已重启"; fixed=$((fixed+1)); } \
+        || { err "中转转发启动失败"; bad=$((bad+1)); }
+    fi
+  fi
+  # 防火墙
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    local p ports=""
+    [[ -n "$PANEL_PORT" ]] && ports="$PANEL_PORT"
+    [[ -s "$VK_NODES" ]] && ports="$ports $(awk -F'|' '{print $3}' "$VK_NODES" | tr '\n' ' ')"
+    for p in $ports; do
+      ufw status | grep -qE "^$p(/| )" || { ufw allow "$p" >/dev/null 2>&1; warn "防火墙未放行 $p，已放行"; fixed=$((fixed+1)); }
+    done
+    ok "系统防火墙检查完成"
+  else
+    ok "系统防火墙未开启（不会拦截）"
+  fi
+  line
+  echo "自动修复: $fixed 项   仍有问题: $bad 项"
+  if (( bad == 0 )); then
+    echo "本机检查都正常。如果还是连不上，常见原因是:"
+    echo "1) 商家后台的防火墙/安全组没放行端口"
+    echo "2) IP 或端口被墙 → 用【被墙检测】"
+    echo "3) 手机代理软件太旧，不支持该协议"
+  else
+    echo "请运行【生成诊断报告】，把内容发给开发者"
+  fi
+  pause
+}
+
+report(){
+  local f="/root/vpskit-report.txt" svc
+  {
+    echo "=== vpskit 诊断报告 v$VK_VERSION  $(date '+%F %T') ==="
+    . /etc/os-release 2>/dev/null; echo "系统: ${PRETTY_NAME:-?}  内核: $(uname -r)  架构: $(uname -m)"
+    echo "虚拟化: $(systemd-detect-virt 2>/dev/null)  内存: $(awk '/MemTotal/{printf "%dMB", $2/1024}' /proc/meminfo)"
+    echo "面板: ${PANEL:-无}  面板端口: ${PANEL_PORT:-无}  协议: $PANEL_SCHEME"
+    echo "NAT: $NAT  端口范围: ${PORT_MIN:-不限}-${PORT_MAX:-不限}  内外同端口: $NAT_SAMEPORT"
+    echo "令牌: $([[ -n "$API_TOKEN" ]] && echo 已设置 || echo 未设置)"
+    echo "--- 节点 ---"
+    [[ -s "$VK_NODES" ]] && awk -F'|' '{print $1" "$2" "$3}' "$VK_NODES"
+    echo "--- 转发 ---"
+    [[ -s "$VK_FWD" ]] && sed -E 's/\|[^|]+\|/|<落地IP>|/' "$VK_FWD"
+    echo "--- 监听端口 ---"
+    ss -lntuH 2>/dev/null | awk '{print $1, $5, $7}' | head -n 40
+    for svc in s-ui x-ui vpskit-realm; do
+      systemctl list-unit-files 2>/dev/null | grep -q "^$svc.service" || continue
+      echo "--- 服务 $svc: $(systemctl is-active "$svc" 2>/dev/null) ---"
+      journalctl -u "$svc" -n 25 --no-pager 2>/dev/null | cut -c1-220
+    done
+    echo "--- 防火墙 ---"
+    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n 20
+  } 2>&1 | sed -E 's/([0-9]{1,3}\.[0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}/\1.x.x/g' > "$f"
+  clear; cat "$f"; line
+  ok "报告已保存到 $f（已隐藏密码和完整IP）"
+  echo "把上面的内容全部复制，发给开发者即可"
+  pause
+}
+
+# ---------- 新手向导 ----------
+wizard(){
+  do_check; pause
+  set_ports || return
+  pause
+  install_panel || { pause; return; }
+  pause
+  if confirm "现在就建一个推荐节点（VLESS + Reality）吗"; then
+    if [[ "$PANEL" == "sui" ]]; then sui_token && sui_vless_reality
+    else xui_token && xui_vless_reality; fi
+  fi
+  pause
+}
+
+# ---------- 主菜单 ----------
+main_menu(){
+  while true; do
+    clear
+    info "=== vpskit 一键工具 v$VK_VERSION ==="
+    local st="未安装面板"
+    [[ "$PANEL" == "sui" ]] && st="s-ui"
+    [[ "$PANEL" == "xui" ]] && st="3x-ui"
+    echo "面板: $st   $([[ "$NAT" == "1" ]] && echo "NAT 机 $PORT_MIN-$PORT_MAX" || echo "普通机器")"
+    line
+    echo " 1. 新手向导（第一次用选这个）"
+    echo " 2. 开机体检"
+    echo " 3. 机器类型与端口（NAT 机设置）"
+    echo " 4. 安装面板"
+    echo " 5. 一键搭建节点"
+    echo " 6. 查看我的节点"
+    echo " 7. 中转 / 端口转发"
+    echo " 8. 检测是否被墙"
+    echo " 9. 一键排查并修复"
+    echo "10. 生成诊断报告"
+    echo "11. 备份与撤销"
+    echo "12. 查看面板地址和密码"
+    echo " 0. 退出"
+    line
+    case "$(ask '请输入数字: ')" in
+      1) wizard ;;
+      2) do_check; pause ;;
+      3) set_ports; pause ;;
+      4) install_panel; pause ;;
+      5) menu_node ;;
+      6) list_nodes ;;
+      7) menu_relay ;;
+      8) check_block ;;
+      9) diagnose ;;
+      10) report ;;
+      11) menu_backup ;;
+      12) show_panel; pause ;;
+      0) exit 0 ;;
+    esac
+  done
+}
+
+main(){
+  need_root
+  load_conf
+  install_deps || exit 1
+  self_install
+  main_menu
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
