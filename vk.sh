@@ -114,6 +114,27 @@ open_fw(){
     ufw allow "$p" >/dev/null 2>&1 && ok "系统防火墙已放行端口 $p"
   fi
 }
+proto_net(){
+  # 协议走 TCP 还是 UDP（NAT 机做端口映射时要选对）
+  case "$1" in
+    hysteria2|tuic) echo "UDP" ;;
+    ss2022|relay)   echo "TCP 和 UDP" ;;
+    *)              echo "TCP" ;;
+  esac
+}
+nat_hint(){
+  # nat_hint 内部端口 协议类型 用途
+  [[ "$NAT" == "1" ]] || return 0
+  line
+  warn "NAT 机：请到商家后台添加端口映射，否则外面连不上"
+  if [[ "$NAT_SAMEPORT" == "1" ]]; then
+    echo "  外部端口 $1  →  内部端口 $1    协议: $2    （用途: $3）"
+  else
+    echo "  外部端口 (你分配的)  →  内部端口 $1    协议: $2    （用途: $3）"
+  fi
+  [[ "$2" == *UDP* ]] && echo "  注意: 协议一定要包含 UDP，只选 TCP 这个节点不会通"
+  line
+}
 gen_uuid(){ cat /proc/sys/kernel/random/uuid; }
 rand_str(){ openssl rand -hex "${1:-6}"; }
 b64url(){ base64 -w0 | tr '+/' '-_' | tr -d '='; }
@@ -310,6 +331,7 @@ install_panel(){
       cp -rf "$tmp/s-ui" /usr/local/
       cp -f "$tmp"/s-ui/*.service /etc/systemd/system/ 2>/dev/null
       systemctl daemon-reload
+      ensure_resolved || warn "域名解析服务没能启动，装完后请运行【一键排查并修复】"
       systemctl enable s-ui --now >/dev/null 2>&1
       PANEL=sui ;;
     2)
@@ -370,6 +392,8 @@ configure_panel(){
   else
     err "面板没有在端口 $PANEL_PORT 上启动，请运行【一键排查】"
   fi
+  nat_hint "$PANEL_PORT" "TCP" "面板"
+  [[ "$PANEL" == "sui" ]] && nat_hint "$SUB_PORT" "TCP" "订阅"
   show_panel
   warn "请截图保存上面的地址、账号、密码"
 }
@@ -381,13 +405,26 @@ detect_scheme(){
 }
 
 # ---------- 面板 API ----------
-sui_base(){ echo "http://127.0.0.1:${PANEL_PORT}/${PANEL_PATH:+$PANEL_PATH/}apiv2"; }
-sui_get(){ curl -s -m 15 -H "Token: $API_TOKEN" "$(sui_base)/$1"; }
+# s-ui 用面板账号密码在本机自动登录（会话存在 cookie 文件里），不需要手动创建令牌
+SUI_CJ="$VK_DIR/.sui-cookie"
+sui_base(){ echo "http://127.0.0.1:${PANEL_PORT}/${PANEL_PATH:+$PANEL_PATH/}api"; }
+sui_curl(){
+  # 面板要求带 X-Requested-With；Host 用公网地址，面板生成的链接才是对的
+  curl -s -b "$SUI_CJ" -H "X-Requested-With: XMLHttpRequest" \
+    -H "Host: ${PUBLIC_HOST:-127.0.0.1}:${PANEL_PORT}" "$@"
+}
+sui_get(){ sui_curl -m 15 "$(sui_base)/$1"; }
 sui_save(){
   # sui_save 对象 动作 JSON
-  curl -s -m 20 -X POST -H "Token: $API_TOKEN" \
-    --data-urlencode "object=$1" --data-urlencode "action=$2" \
+  sui_curl -m 30 --data-urlencode "object=$1" --data-urlencode "action=$2" \
     --data-urlencode "data=$3" "$(sui_base)/save"
+}
+sui_login(){
+  mkdir -p "$VK_DIR"; : > "$SUI_CJ"; chmod 600 "$SUI_CJ"
+  local r
+  r=$(sui_curl -m 10 -c "$SUI_CJ" --data-urlencode "user=$PANEL_USER" \
+        --data-urlencode "pass=$PANEL_PASS" "$(sui_base)/login")
+  sui_ok "$r"
 }
 sui_find_id(){
   # sui_find_id 接口 字段 值
@@ -397,27 +434,21 @@ sui_find_id(){
 sui_ok(){ [[ "$(echo "$1" | jq -r '.success' 2>/dev/null)" == "true" ]]; }
 
 sui_token(){
-  if [[ -n "$API_TOKEN" ]]; then
-    sui_ok "$(sui_get inbounds)" && return 0
-    warn "保存的令牌已失效，需要重新获取"
+  # 名字沿用旧的；现在是自动登录，全程不用用户动手
+  get_host >/dev/null
+  [[ -s "$SUI_CJ" ]] && sui_ok "$(sui_get inbounds)" && return 0
+  local i
+  for i in 1 2 3 4 5; do sui_login && return 0; sleep 2; done
+  if ! systemctl is-active --quiet s-ui; then
+    err "面板没有在运行，请先运行【一键排查并修复】"; return 1
   fi
   line
-  info "s-ui 需要你在面板里创建一次“API 令牌”"
-  echo "只需做这一次，之后都是自动的："
-  echo "1) 用浏览器打开面板并登录"
-  show_panel
-  echo "2) 进入 管理员(Admins) 页面"
-  echo "3) 新建 API Token，有效期选最长"
-  echo "4) 复制生成的那串字符，粘贴到这里"
-  local t; t=$(ask "粘贴令牌: ")
-  t=$(echo "$t" | tr -d '[:space:]')
-  [[ -z "$t" ]] && return 1
-  API_TOKEN=$t
-  if sui_ok "$(sui_get inbounds)"; then
-    save_conf; ok "令牌有效，已保存"
-  else
-    API_TOKEN=""; err "令牌无效，请重新复制后再试"; return 1
-  fi
+  warn "用保存的账号密码登录面板失败（你可能在面板里改过密码）"
+  echo "请输入现在的面板账号和密码，只需这一次："
+  PANEL_USER=$(ask "面板账号: ")
+  read -rsp "面板密码（输入时不显示）: " PANEL_PASS; echo
+  if sui_login; then save_conf; ok "登录成功，已保存"
+  else err "还是登录不上，请核对账号密码后再试"; return 1; fi
 }
 
 xui_base(){ echo "${PANEL_SCHEME}://127.0.0.1:${PANEL_PORT}/${PANEL_PATH:+$PANEL_PATH/}panel/api"; }
@@ -458,6 +489,7 @@ node_done(){
     systemctl restart "$(panel_service)"; sleep 4
     port_in_use "$port" && ok "重启后正常了" || err "仍未监听，请运行【一键排查】并把诊断报告发给开发者"
   fi
+  nat_hint "$port" "$(proto_net "$proto")" "节点 $name"
   show_link "$name" "$link"
 }
 
@@ -467,7 +499,7 @@ sui_vless_reality(){
   uuid=$(gen_uuid); sid=$(openssl rand -hex 4); sni=$(pick_sni)
   keys=$(gen_x25519) || { err "生成密钥失败"; return 1; }
   priv=${keys% *}; pub=${keys#* }
-  tag="vk-vless-$port"
+  tag="${1:-vk-vless}-$port"; LAST_TAG=""
   r=$(sui_save tls new "$(jq -cn --arg n "$tag" --arg sni "$sni" --arg priv "$priv" --arg pub "$pub" --arg sid "$sid" \
     '{name:$n,
       server:{enabled:true,server_name:$sni,
@@ -486,8 +518,43 @@ sui_vless_reality(){
       config:{vless:{name:$n,uuid:$u,flow:"xtls-rprx-vision"}}}')")
   sui_ok "$r" || { err "创建用户失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
   host=$(get_host); eport=$(ext_port "$port")
+  LAST_TAG=$tag
   node_done "$tag" "vless-reality" "$port" \
     "vless://${uuid}@${host}:${eport}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp#${tag}"
+}
+
+sui_tuic(){
+  local port uuid pass tag host eport r tls_id in_id cdir="$VK_DIR/cert" sni="bing.com"
+  port=$(pick_port) || { err "没有空闲端口"; return 1; }
+  uuid=$(gen_uuid); pass=$(rand_str 8); tag="vk-tuic-$port"
+  mkdir -p "$cdir"
+  if [[ ! -f "$cdir/self.crt" ]]; then
+    openssl ecparam -genkey -name prime256v1 -out "$cdir/self.key" 2>/dev/null
+    openssl req -new -x509 -days 3650 -key "$cdir/self.key" -out "$cdir/self.crt" -subj "/CN=$sni" 2>/dev/null \
+      || { err "生成自签证书失败"; return 1; }
+    chmod 644 "$cdir/self.crt"; chmod 600 "$cdir/self.key"
+  fi
+  r=$(sui_save tls new "$(jq -cn --arg n "$tag" --arg sni "$sni" --arg c "$cdir/self.crt" --arg k "$cdir/self.key" \
+    '{name:$n,
+      server:{enabled:true,server_name:$sni,alpn:["h3"],certificate_path:$c,key_path:$k},
+      client:{insecure:true}}')")
+  sui_ok "$r" || { err "创建 TLS 配置失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  tls_id=$(sui_find_id tls name "$tag")
+  [[ -z "$tls_id" ]] && { err "找不到刚创建的 TLS 配置"; return 1; }
+  r=$(sui_save inbounds new "$(jq -cn --arg t "$tag" --argjson p "$port" --argjson tid "$tls_id" \
+    '{type:"tuic",tag:$t,listen:"::",listen_port:$p,tls_id:$tid,congestion_control:"bbr",addrs:[],out_json:{}}')")
+  sui_ok "$r" || { err "创建入站失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  in_id=$(sui_find_id inbounds tag "$tag")
+  [[ -z "$in_id" ]] && { err "找不到刚创建的入站"; return 1; }
+  r=$(sui_save clients new "$(jq -cn --arg n "$tag" --arg u "$uuid" --arg pw "$pass" --argjson i "$in_id" \
+    '{enable:true,name:$n,inbounds:[$i],links:[],volume:0,expiry:0,
+      config:{tuic:{name:$n,uuid:$u,password:$pw}}}')")
+  sui_ok "$r" || { err "创建用户失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  host=$(get_host); eport=$(ext_port "$port")
+  warn "TUIC 走 UDP：NAT 机的端口映射要选 UDP"
+  echo "手机端提示: 节点里要打开“允许不安全”；小火箭测速方式改成 CONNECT 才测得出延迟"
+  node_done "$tag" "tuic" "$port" \
+    "tuic://${uuid}:${pass}@${host}:${eport}?security=tls&insecure=1&allow_insecure=1&sni=${sni}&alpn=h3&congestion_control=bbr#${tag}"
 }
 
 sui_hysteria2(){
@@ -602,6 +669,9 @@ menu_node(){
     echo "2. Hysteria2"
     echo "   优点: 线路差时提速明显"
     echo "   缺点: 走 UDP，可能被限速，部分 NAT 机不支持"
+    echo "3. TUIC"
+    echo "   优点: 延迟低，连接快"
+    echo "   缺点: 走 UDP，部分手机网络下不稳定"
   else
     echo "1. VLESS + Reality  [推荐]"
     echo "   优点: 不要域名证书，伪装强，NAT 机可用"
@@ -612,13 +682,14 @@ menu_node(){
   fi
   echo "0. 返回"
   local c; c=$(ask "请选择: ")
-  [[ "$c" == "1" || "$c" == "2" ]] || return
+  [[ "$c" == "1" || "$c" == "2" || ( "$c" == "3" && "$PANEL" == "sui" ) ]] || return
   if [[ "$PANEL" == "sui" ]]; then sui_token || { pause; return; }
   else xui_token || { pause; return; }; fi
   backup_now before-node >/dev/null
   case "$PANEL:$c" in
     sui:1) sui_vless_reality ;;
     sui:2) sui_hysteria2 ;;
+    sui:3) sui_tuic ;;
     xui:1) xui_vless_reality ;;
     xui:2) xui_ss2022 ;;
   esac
@@ -707,6 +778,7 @@ fwd_add(){
   realm_apply; open_fw "$lp"; sleep 1
   if port_in_use "$lp"; then ok "转发已生效: 本机 $lp -> $rh:$rp"
   else err "转发没有启动，请运行【一键排查】"; return 1; fi
+  nat_hint "$lp" "TCP 和 UDP" "中转转发"
   local host eport link
   host=$(get_host); eport=$(ext_port "$lp")
   echo "把落地机的节点链接粘贴到这里，自动生成中转版链接"
@@ -717,6 +789,50 @@ fwd_add(){
     show_link "中转-$lp" "$nl"
   else
     echo "手动改法: 把节点里的地址改成 $host，端口改成 $eport"
+  fi
+}
+chain_add(){
+  # 链式代理：本机新开一个 VLESS-Reality 入口，进来的流量经面板内核转发到落地机
+  [[ "$PANEL" == "sui" ]] || { warn "链式代理目前只支持 s-ui 面板；3x-ui 请用【纯端口转发】"; return 1; }
+  sui_token || return 1
+  info "这台机器将作为【中转机】，流量从落地机出去"
+  echo "请粘贴落地机的节点链接（vless:// 等，整行复制）"
+  local link; link=$(ask "落地机节点链接: ")
+  link=$(echo "$link" | tr -d '\r' | sed 's/^ *//;s/ *$//')
+  [[ "$link" == *"://"* ]] || { err "这不是节点链接"; return 1; }
+  local dh dp
+  dh=$(echo "$link" | sed -nE 's#^[a-z0-9+]+://[^@]+@\[?([^]:/?\#]+)\]?:([0-9]+).*#\1#p')
+  dp=$(echo "$link" | sed -nE 's#^[a-z0-9+]+://[^@]+@\[?([^]:/?\#]+)\]?:([0-9]+).*#\2#p')
+  if [[ -n "$dh" && -n "$dp" && "$link" != tuic://* && "$link" != hy* ]]; then
+    if timeout 6 bash -c "</dev/tcp/$dh/$dp" 2>/dev/null; then ok "本机到落地机 $dh:$dp 连通正常"
+    else err "本机连不上落地机 $dh:$dp（落地机没开、端口没映射，或两台之间不通）"; return 1; fi
+  fi
+  local r out out_tag
+  r=$(sui_curl -m 15 --data-urlencode "link=$link" "$(sui_base)/linkConvert")
+  sui_ok "$r" || { err "面板不认识这条链接: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  out_tag="vk-out-$(rand_str 3)"
+  out=$(echo "$r" | jq -c --arg t "$out_tag" '.obj | .tag=$t | del(.id)' 2>/dev/null)
+  [[ -n "$out" && "$out" != "null" ]] || { err "链接转换结果异常"; return 1; }
+  backup_now before-chain >/dev/null
+  r=$(sui_save outbounds new "$out")
+  sui_ok "$r" || { err "创建出站失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  ok "已添加通往落地机的出站 $out_tag"
+  sui_vless_reality "vk-chain" || { err "创建中转入口失败"; return 1; }
+  [[ -n "$LAST_TAG" ]] || { err "创建中转入口失败"; return 1; }
+  local cfg new
+  cfg=$(sui_get config | jq -c '.obj.config' 2>/dev/null)
+  [[ -n "$cfg" && "$cfg" != "null" ]] || { err "读取面板核心配置失败，中转规则没有加上"; return 1; }
+  new=$(echo "$cfg" | jq -c --arg i "$LAST_TAG" --arg o "$out_tag" \
+    '.route.rules = ((.route.rules // []) + [{inbound:[$i],action:"route",outbound:$o}])')
+  r=$(sui_save config new "$new")
+  sui_ok "$r" || { err "保存路由规则失败: $(echo "$r" | jq -r '.msg' 2>/dev/null)"; return 1; }
+  sleep 6
+  local lp=${LAST_TAG##*-}
+  if port_in_use "$lp"; then
+    ok "链式中转已生效: 你 → 本机($LAST_TAG) → 落地机"
+    echo "用上面那条 $LAST_TAG 的链接/二维码连接即可，出口 IP 会是落地机的"
+  else
+    err "中转入口端口 $lp 没有监听，请运行【一键排查并修复】"; return 1
   fi
 }
 fwd_del(){
@@ -735,16 +851,17 @@ menu_relay(){
   echo "2. 加密隧道中转  (下一版)"
   echo "   优点: 过境多一层伪装，更抗封"
   echo "   缺点: 两端都要配置，速度略损耗"
-  echo "3. 链式代理  (下一版)"
-  echo "   优点: 面板里管理，可在中转机分流"
-  echo "   缺点: 最占资源，不适合小 NAT 机"
+  echo "3. 链式代理  [落地机被墙时用这个，需 s-ui 面板]"
+  echo "   优点: 过境段有 Reality 伪装，面板里可管理和分流"
+  echo "   缺点: 比纯转发多占一点资源"
   line
   echo "4. 查看已有转发"
   echo "5. 删除转发"
   echo "0. 返回"
   case "$(ask '请选择: ')" in
     1) fwd_add ;;
-    2|3) warn "这个组合在下一版加入" ;;
+    2) warn "这个组合在下一版加入" ;;
+    3) chain_add ;;
     4) [[ -s "$VK_FWD" ]] && nl -w1 -s'. ' "$VK_FWD" | sed 's/|/ -> /; s/|/:/' || warn "没有转发规则" ;;
     5) fwd_del ;;
     *) return ;;
@@ -768,7 +885,7 @@ check_block(){
   echo "[1/3] 本机是否在监听"
   if port_in_use "$port"; then ok "端口在监听"
   else err "本机没有程序在用这个端口 → 不是被墙，是服务没起来，请运行【一键排查】"; pause; return; fi
-  if grep -qE "\|hysteria2\|${port}\|" "$VK_NODES" 2>/dev/null; then
+  if grep -qE "\|(hysteria2|tuic)\|${port}\|" "$VK_NODES" 2>/dev/null; then
     warn "这是 UDP 节点，下面的 TCP 检测对它不适用"
   fi
   echo "[2/3] 从国外多个地点连接测试"
@@ -801,21 +918,63 @@ check_block(){
 }
 
 # ---------- 排查与修复 ----------
+has_resolved(){ systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved\.service'; }
+ensure_resolved(){
+  # s-ui 的内核通过 systemd-resolved 查域名；它没运行时节点"连得上但打不开网页"
+  has_resolved || return 0
+  systemctl is-active --quiet systemd-resolved && return 0
+  systemctl enable --now systemd-resolved >/dev/null 2>&1
+  sleep 2
+  systemctl is-active --quiet systemd-resolved
+}
+dns_works(){ timeout 8 getent hosts github.com >/dev/null 2>&1; }
+fix_dns(){
+  # 在 diagnose 里调用，直接累加它的 fixed / bad
+  local restart_panel=0
+  if has_resolved && ! systemctl is-active --quiet systemd-resolved; then
+    warn "系统的域名解析服务没有运行，正在启动 ..."
+    if ensure_resolved; then ok "域名解析服务已启动"; fixed=$((fixed+1)); restart_panel=1
+    else err "域名解析服务启动失败"; bad=$((bad+1)); fi
+  fi
+  if ! dns_works; then
+    warn "域名解析失败，尝试修复 ..."
+    if [[ -L /etc/resolv.conf ]] && has_resolved; then
+      mkdir -p /etc/systemd/resolved.conf.d
+      printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\nFallbackDNS=9.9.9.9\n' > /etc/systemd/resolved.conf.d/vpskit.conf
+      systemctl restart systemd-resolved >/dev/null 2>&1; sleep 2
+    else
+      [[ -e /etc/resolv.conf && ! -e /etc/resolv.conf.vkbak ]] && cp -fP /etc/resolv.conf /etc/resolv.conf.vkbak 2>/dev/null
+      rm -f /etc/resolv.conf
+      printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+    fi
+    if dns_works; then ok "域名解析已修复"; fixed=$((fixed+1)); restart_panel=1
+    else err "域名解析修复失败"; bad=$((bad+1)); fi
+  else
+    ok "域名解析正常"
+  fi
+  # 面板日志里的解析报错：系统看着正常，但内核查不到域名
+  if [[ "$PANEL" == "sui" ]] && journalctl -u s-ui --since "15 min ago" --no-pager 2>/dev/null \
+       | grep -q 'org.freedesktop.resolve1'; then
+    warn "面板日志里有域名解析报错（节点会连得上但打不开网页）"
+    if has_resolved && ! timeout 8 resolvectl query github.com >/dev/null 2>&1; then
+      err "系统内部通信卡住了，需要重启服务器才能恢复"; bad=$((bad+1))
+      if confirm "现在重启服务器吗（约 1-2 分钟后重新连接即可）"; then reboot; exit 0; fi
+      return
+    fi
+    restart_panel=1
+  fi
+  if (( restart_panel )) && [[ -n "$PANEL" ]]; then
+    systemctl restart "$(panel_service)"; sleep 3
+    ok "已重启面板，让它用上修好的域名解析"
+  fi
+}
 diagnose(){
   clear; info "== 一键排查并修复 =="
   local fixed=0 bad=0 svc
   # 网络
   if curl -s -m 8 -o /dev/null https://www.cloudflare.com; then ok "外网连接正常"
   else err "服务器访问不了外网（请联系商家）"; bad=$((bad+1)); fi
-  if getent hosts github.com >/dev/null 2>&1; then ok "域名解析正常"
-  else
-    warn "域名解析失败，尝试修复 ..."
-    if [[ ! -L /etc/resolv.conf ]]; then
-      cp -f /etc/resolv.conf /etc/resolv.conf.vkbak 2>/dev/null
-      printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-      getent hosts github.com >/dev/null 2>&1 && { ok "已修复"; fixed=$((fixed+1)); } || { err "修复失败"; bad=$((bad+1)); }
-    else err "需要手动处理 DNS，请把诊断报告发给开发者"; bad=$((bad+1)); fi
-  fi
+  fix_dns
   # 时间
   if command -v timedatectl >/dev/null 2>&1; then
     if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then ok "系统时间已同步"
