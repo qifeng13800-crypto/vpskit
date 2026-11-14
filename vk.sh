@@ -24,8 +24,8 @@ confirm(){ local a; read -rp "$1 [y/n]: " a; [[ "$a" == "y" || "$a" == "Y" ]]; }
 # ---------- 配置 ----------
 PORT_MIN=""; PORT_MAX=""; PORT_EXCLUDE=""; NAT=0; NAT_SAMEPORT=1; PUBLIC_HOST=""
 PANEL=""; PANEL_PORT=""; PANEL_PATH=""; PANEL_USER=""; PANEL_PASS=""
-PANEL_SCHEME="http"; API_TOKEN=""; SUB_PORT=""; SUB_PATH=""
-CONF_KEYS="PORT_MIN PORT_MAX PORT_EXCLUDE NAT NAT_SAMEPORT PUBLIC_HOST PANEL PANEL_PORT PANEL_PATH PANEL_USER PANEL_PASS PANEL_SCHEME API_TOKEN SUB_PORT SUB_PATH"
+PANEL_SCHEME="http"; API_TOKEN=""; SUB_PORT=""; SUB_PATH=""; KOMARI_PORT=""
+CONF_KEYS="PORT_MIN PORT_MAX PORT_EXCLUDE NAT NAT_SAMEPORT PUBLIC_HOST PANEL PANEL_PORT PANEL_PATH PANEL_USER PANEL_PASS PANEL_SCHEME API_TOKEN SUB_PORT SUB_PATH KOMARI_PORT"
 
 load_conf(){ [[ -f "$VK_CONF" ]] && . "$VK_CONF"; return 0; }
 save_conf(){
@@ -888,6 +888,209 @@ menu_relay(){
   pause
 }
 
+# ---------- Komari 探针 ----------
+KM_DIR="/opt/komari"                    # 和官方脚本用同一个目录，方便以后用官方脚本升级
+KM_AGENT_CONF="$VK_DIR/komari-agent.json"
+km_arch(){ local a; a=$(arch_name); [[ "$a" == "unknown" ]] && return 1; echo "$a"; }
+km_server_installed(){ [[ -x "$KM_DIR/komari" ]]; }
+km_agent_installed(){ [[ -x "$KM_DIR/agent" ]]; }
+km_server_url(){ echo "http://$(get_host):${KOMARI_PORT}"; }
+
+km_server_install(){
+  if km_server_installed; then
+    warn "本机已经装了探针面板"; km_status; return 0
+  fi
+  local a tmp
+  a=$(km_arch) || { err "CPU 架构不支持"; return 1; }
+  info "探针面板只需要装在【一台】机器上，其他机器装客户端连过来就行"
+  echo "建议装在国内能直连、不会被墙的那台上，否则你打不开它的网页"
+  confirm "就装在这台吗" || return 1
+  tmp=$(mktemp -d)
+  info "正在下载 Komari 面板 ..."
+  download "https://github.com/komari-monitor/komari/releases/latest/download/komari-linux-${a}" "$tmp/komari" \
+    || { err "下载失败：服务器连不上 GitHub，稍后再试"; rm -rf "$tmp"; return 1; }
+  KOMARI_PORT=$(pick_port) || { err "没有空闲端口"; rm -rf "$tmp"; return 1; }
+  mkdir -p "$KM_DIR"
+  install -m 755 "$tmp/komari" "$KM_DIR/komari"; rm -rf "$tmp"
+  cat > /etc/systemd/system/komari.service <<EOF
+[Unit]
+Description=Komari Monitor Service
+After=network.target
+
+[Service]
+Type=simple
+Environment="GODEBUG=disablethp=1"
+ExecStart=$KM_DIR/komari server -l 0.0.0.0:${KOMARI_PORT}
+WorkingDirectory=$KM_DIR
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable komari >/dev/null 2>&1
+  systemctl restart komari
+  save_conf; open_fw "$KOMARI_PORT"; sleep 3
+  if ! port_in_use "$KOMARI_PORT"; then
+    err "探针面板没有启动，最近的日志:"
+    journalctl -u komari -n 8 --no-pager 2>/dev/null | cut -c1-200
+    return 1
+  fi
+  ok "探针面板已启动"
+  nat_hint "$KOMARI_PORT" "TCP" "探针面板"
+  line
+  echo "探针面板地址: $(km_server_url)"
+  line
+  warn "请【现在】就用浏览器打开上面的地址，创建管理员账号"
+  echo "第一个打开网页的人会成为管理员，所以不要拖，也不要把地址发给别人"
+  echo
+  echo "建好账号后，添加被监控机器的方法:"
+  echo "  1) 在探针网页后台点“添加节点”，它会给出一条安装命令"
+  echo "  2) 到要监控的机器上运行 vk → 13 → 2，把那条命令整行粘贴进去"
+  echo "  （本机也要被监控的话，在本机同样做一遍第 2 步）"
+}
+
+km_parse(){
+  # km_parse 文本 短参数 长参数  -> 取出参数值（支持从官方安装命令里整行解析）
+  echo "$1" | tr -d '\r' | sed -nE "s/.*(^|[[:space:]])(-$2|--$3)[[:space:]=]+[\"']?([^\"'[:space:]]+).*/\\3/p"
+}
+km_agent_install(){
+  local a tmp inp ep tk rc="true"
+  a=$(km_arch) || { err "CPU 架构不支持"; return 1; }
+  if km_agent_installed; then
+    warn "本机已经装了探针客户端，继续会用新的地址和密钥覆盖"
+    confirm "继续吗" || return 0
+  fi
+  info "这台机器将被探针面板监控"
+  echo "到探针网页后台点“添加节点”，复制它给出的安装命令，整行粘贴到这里。"
+  echo "（没有安装命令也行：直接回车，然后分别输入面板地址和密钥）"
+  inp=$(ask "粘贴安装命令: ")
+  ep=$(km_parse "$inp" e endpoint); tk=$(km_parse "$inp" t token)
+  if [[ -z "$ep" ]]; then
+    local def=""
+    km_server_installed && [[ -n "$KOMARI_PORT" ]] && def="http://127.0.0.1:${KOMARI_PORT}"
+    ep=$(ask "探针面板地址（如 http://1.2.3.4:25774）${def:+，本机直接回车}: ")
+    ep=${ep:-$def}
+  fi
+  [[ -z "$tk" ]] && tk=$(ask "节点密钥 (token): ")
+  ep=$(echo "$ep" | tr -d '[:space:]'); ep=${ep%/}; tk=$(echo "$tk" | tr -d '[:space:]')
+  [[ "$ep" =~ ^https?://[^/]+ && -n "$tk" ]] || { err "地址或密钥不对。地址要以 http:// 或 https:// 开头"; return 1; }
+  local code
+  code=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' "$ep/" 2>/dev/null)
+  if [[ "$code" == "000" || -z "$code" ]]; then
+    err "这台机器连不上探针面板 $ep"
+    echo "常见原因: 地址或端口写错、面板那台的端口没放行（NAT 机要做端口映射）"
+    confirm "仍然继续安装吗" || return 1
+  else
+    ok "能连上探针面板"
+  fi
+  line
+  echo "要不要允许从探针网页【远程控制】这台机器（网页终端、远程执行命令）？"
+  echo "  选 n: 只上报监控数据，最安全  [推荐]"
+  echo "  选 y: 方便，但探针面板的账号一旦泄露，这台机器也会被控制"
+  confirm "允许远程控制" && rc="false"
+  tmp=$(mktemp -d)
+  info "正在下载 Komari 客户端 ..."
+  download "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${a}" "$tmp/agent" \
+    || { err "下载失败：服务器连不上 GitHub，稍后再试"; rm -rf "$tmp"; return 1; }
+  mkdir -p "$KM_DIR" "$VK_DIR"
+  systemctl stop komari-agent 2>/dev/null
+  install -m 755 "$tmp/agent" "$KM_DIR/agent"; rm -rf "$tmp"
+  # 密钥放在只有 root 能读的配置文件里，不写进服务文件（那里谁都能看到）
+  ( umask 077; jq -n --arg e "$ep" --arg t "$tk" --argjson d "$rc" \
+      '{endpoint:$e,token:$t,disable_web_ssh:$d}' > "$KM_AGENT_CONF" )
+  chmod 600 "$KM_AGENT_CONF"
+  cat > /etc/systemd/system/komari-agent.service <<EOF
+[Unit]
+Description=Komari Agent Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$KM_DIR/agent --config $KM_AGENT_CONF
+WorkingDirectory=$KM_DIR
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable komari-agent >/dev/null 2>&1
+  systemctl restart komari-agent
+  sleep 4
+  if systemctl is-active --quiet komari-agent; then
+    ok "探针客户端已启动"
+    echo "回到探针网页看一下，这台机器应该在几秒内显示为在线"
+    [[ "$rc" == "true" ]] && echo "远程控制: 已关闭" || warn "远程控制: 已开启"
+    if journalctl -u komari-agent --since "10 sec ago" --no-pager 2>/dev/null | grep -qiE 'unauthorized|invalid token|401|403'; then
+      warn "日志里有认证失败的字样，密钥可能不对。到探针后台重新复制安装命令再试"
+    fi
+  else
+    err "探针客户端启动失败，最近的日志:"
+    journalctl -u komari-agent -n 8 --no-pager 2>/dev/null | cut -c1-200
+    return 1
+  fi
+}
+
+km_status(){
+  line
+  if km_server_installed; then
+    echo "探针面板  : $(systemctl is-active komari 2>/dev/null)   地址: $(km_server_url)"
+  else echo "探针面板  : 本机未安装"; fi
+  if km_agent_installed; then
+    local ep rc
+    ep=$(jq -r '.endpoint // "未知"' "$KM_AGENT_CONF" 2>/dev/null)
+    rc=$(jq -r 'if .disable_web_ssh then "关闭" else "开启" end' "$KM_AGENT_CONF" 2>/dev/null)
+    echo "探针客户端: $(systemctl is-active komari-agent 2>/dev/null)   连接到: ${ep:-未知}   远程控制: ${rc:-未知}"
+  else echo "探针客户端: 本机未安装"; fi
+  line
+}
+
+km_uninstall(){
+  echo "1. 卸载探针客户端"
+  echo "2. 卸载探针面板（监控历史数据会一起删除）"
+  echo "0. 返回"
+  case "$(ask '请选择: ')" in
+    1)
+      km_agent_installed || { warn "本机没装探针客户端"; return; }
+      confirm "确认卸载探针客户端" || return
+      systemctl disable komari-agent --now >/dev/null 2>&1
+      rm -f /etc/systemd/system/komari-agent.service "$KM_DIR/agent" "$KM_AGENT_CONF"
+      systemctl daemon-reload; ok "已卸载探针客户端"
+      echo "探针网页后台里这台机器的记录需要你手动删除" ;;
+    2)
+      km_server_installed || { warn "本机没装探针面板"; return; }
+      warn "卸载后，所有机器的监控历史和探针后台的账号都会删除，无法恢复"
+      confirm "确认卸载探针面板" || return
+      systemctl disable komari --now >/dev/null 2>&1
+      rm -f /etc/systemd/system/komari.service "$KM_DIR/komari"
+      rm -rf "$KM_DIR/data"
+      systemctl daemon-reload; KOMARI_PORT=""; save_conf; ok "已卸载探针面板" ;;
+  esac
+}
+
+menu_komari(){
+  clear; info "== Komari 探针（看所有机器的在线、流量、负载） =="
+  km_status
+  echo "1. 安装探针面板   （只在一台机器上装，用浏览器看）"
+  echo "2. 安装探针客户端 （每台要监控的机器都装）"
+  echo "3. 重启探针"
+  echo "4. 卸载"
+  echo "0. 返回"
+  case "$(ask '请选择: ')" in
+    1) km_server_install ;;
+    2) km_agent_install ;;
+    3) km_server_installed && systemctl restart komari
+       km_agent_installed && systemctl restart komari-agent
+       sleep 2; km_status ;;
+    4) km_uninstall ;;
+    *) return ;;
+  esac
+  pause
+}
+
 # ---------- 被墙检测 ----------
 check_block(){
   clear; info "== 检测 IP / 端口是否被墙 =="
@@ -1127,6 +1330,17 @@ diagnose(){
         || { err "中转转发启动失败"; bad=$((bad+1)); }
     fi
   fi
+  # 探针
+  local ksvc
+  for ksvc in komari komari-agent; do
+    [[ -f "/etc/systemd/system/$ksvc.service" ]] || continue
+    if systemctl is-active --quiet "$ksvc"; then ok "探针服务 $ksvc 在运行"
+    else
+      systemctl restart "$ksvc"; sleep 2
+      systemctl is-active --quiet "$ksvc" && { ok "探针服务 $ksvc 已重启"; fixed=$((fixed+1)); } \
+        || { err "探针服务 $ksvc 启动失败"; bad=$((bad+1)); }
+    fi
+  done
   # 防火墙
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     local p ports=""
@@ -1167,7 +1381,7 @@ report(){
     [[ -s "$VK_FWD" ]] && sed -E 's/\|[^|]+\|/|<落地IP>|/' "$VK_FWD"
     echo "--- 监听端口 ---"
     ss -lntuH 2>/dev/null | awk '{print $1, $5, $7}' | head -n 40
-    for svc in s-ui x-ui vpskit-realm; do
+    for svc in s-ui x-ui vpskit-realm komari komari-agent; do
       systemctl list-unit-files 2>/dev/null | grep -q "^$svc.service" || continue
       echo "--- 服务 $svc: $(systemctl is-active "$svc" 2>/dev/null) ---"
       journalctl -u "$svc" -n 25 --no-pager 2>/dev/null | cut -c1-220
@@ -1217,6 +1431,7 @@ main_menu(){
     echo "10. 生成诊断报告"
     echo "11. 备份与撤销"
     echo "12. 查看面板地址和密码"
+    echo "13. Komari 探针（监控所有机器）"
     echo " 0. 退出"
     line
     case "$(ask '请输入数字: ')" in
@@ -1232,6 +1447,7 @@ main_menu(){
       10) report ;;
       11) menu_backup ;;
       12) show_panel; pause ;;
+      13) menu_komari ;;
       0) exit 0 ;;
     esac
   done
