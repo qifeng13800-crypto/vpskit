@@ -1232,7 +1232,7 @@ km_add_node(){
       warn "本机已经装过探针客户端了，继续会登记成一台新机器并覆盖原来的"
       confirm "继续吗" || continue
     fi
-    km_ask_billing
+    B_ROTATE=0
     r=$(km_api POST /api/admin/client/add "$(jq -cn --arg n "$name" '{name:$n}')")
     uuid=$(echo "$r" | jq -r '[.. | objects | select(has("token") and has("uuid")) | .uuid][0] // empty' 2>/dev/null)
     token=$(echo "$r" | jq -r '[.. | objects | select(has("token") and has("uuid")) | .token][0] // empty' 2>/dev/null)
@@ -1240,7 +1240,6 @@ km_add_node(){
       err "在探针后台登记失败: $(echo "$r" | cut -c1-160)"; return 1
     fi
     ok "已在探针后台登记: $name"
-    km_apply_billing "$uuid"
     if [[ "$where" == "1" ]]; then
       km_agent_deploy "$(km_local)" "$token" true "$B_ROTATE"
     else
