@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# vpskit (vk) —— 小白一键工具  第一版 v0.1
+# vpskit (vk) —— 小白一键工具  v0.2
 # 适配: Ubuntu 22/24, Debian 11/12   需要 root
 # 用法: bash vk.sh    安装后直接输入: vk
 
-VK_VERSION="0.1"
+VK_VERSION="0.2"
 VK_DIR="/etc/vpskit"
 VK_CONF="$VK_DIR/vpskit.conf"
 VK_NODES="$VK_DIR/nodes.txt"
